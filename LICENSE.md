@@ -6,7 +6,7 @@ FSL-1.1-MIT
 
 ## Notice
 
-Copyright ${year} ${licensor name}
+Copyright 2026 Fractal Frame BV
 
 ## Terms and Conditions
 
@@ -35,10 +35,12 @@ service that:
 
 1. substitutes for the Software;
 
-2. substitutes for any other product or service we offer using the Software
-   that exists as of the date we make the Software available; or
+2. distributing, sublicensing, or otherwise making the Software available as a
+   stand-alone product or as part of a product or service whose primary purpose
+   is to provide access to the Software; or
 
-3. offers the same or substantially similar functionality as the Software.
+3. offering a product or service that substantially replicates the functionality
+   of the Software and is marketed as a replacement for it.
 
 Permitted Purposes specifically include using the Software:
 
@@ -87,7 +89,7 @@ trademarks, trade names, service marks or product names.
 ## Grant of Future License
 
 We hereby irrevocably grant you an additional license to use the Software under
-the MIT license that is effective on the second anniversary of the date we make
+the MIT license that is effective on the tenth anniversary of the date we make
 the Software available. On or after that date, you may use the Software under
 the MIT license, in which case the following will apply:
 
