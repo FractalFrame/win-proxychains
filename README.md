@@ -26,7 +26,7 @@ Win-proxychains was tested on Windows 11 and Windows 10, against firefox.exe, ms
 
 ## Opsec notice
 
-**DO NOT** rely on win-proxychains to fully isolate your connection and prevent leakage of DNS requests. Due to the sprawling number of DNS resolving infrastructure in Windows only a best effort attempt was made to implement `proxy_dns` mode, several known avenues of DNS leakage remain due to implementation complexity. Applications coded to use these avenues to resolve DNS names *will* leak DNS traffic on your local interfaces. *win-proxychains should be considered as a convenience tool, not an airgap*.
+**DO NOT** rely on win-proxychains to fully prevent leakage of DNS requests. Due to the sprawling number of DNS resolving infrastructure in Windows only a best effort attempt was made to implement `proxy_dns` mode, several known avenues of DNS leakage remain due to implementation complexity. Applications written to use these APIs or mechanisms to resolve DNS names *will* leak DNS traffic on your local interfaces. *win-proxychains should be considered a convenience tool, not an airgap*.
 
 The DNS leakage gap is as follows:
 
