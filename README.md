@@ -78,6 +78,11 @@ Configuration of a "leak free" `win-proxychains` setup is out of scope for this 
 
 To be clear: `win-proxychains` is not malware, or a virus, and does not contain malicious code.
 
+## TODO:
+* 32-bit support
+* GetAddrInfoEx support
+* default config file location lookup
+
 ## License
 
 Copyright (c) 2026 FractalFrame BV
