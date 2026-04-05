@@ -2,7 +2,7 @@
 
 `win-proxychains` is a clone of [proxychains](https://github.com/haad/proxychains) for windows, it implements many of the original features. 
 
-While `win-proxychains` preserves the core concepts and goals of the original proxychains, the implementation and architecture differ significantly due to platform differences (Linux v.s. Windows) and the resulting design decisions. Please review the section `Scope` to further understand the differences between proxychains and win-proxychains.
+While `win-proxychains` preserves the core concepts and goals of the original proxychains, the implementation and architecture differ significantly due to platform differences (Linux v.s. Windows) and the resulting design decisions. 
 
 ## Usage
 
