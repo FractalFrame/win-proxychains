@@ -18,6 +18,17 @@ win-proxychains.exe -c default_config.conf
 
 `win-proxychains` may look for the config path set in `WIN_PROXYCHAINS_CONFIG` if no config is supplied as an argument.
 
+To build `win-proxychains` you need at least:
+
+- rustc 1.92.0-nightly (4645a7988 2025-09-17)
+- cargo 1.92.0-nightly (966f94733 2025-09-16)
+
+You can use the following command in the root of the repository to build:
+
+```
+cargo build --release
+```
+
 ## Features
 `Win-proxychains` was tested on Windows 11 and Windows 10, against firefox.exe, msedge.exe, chrome.exe, and various test programs. Currently `win-proxychains` only supports 64 bit programs. 
 
