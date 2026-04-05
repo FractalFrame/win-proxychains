@@ -2,9 +2,8 @@
 // Part of the win-proxychains project. Licensed under BSL-1.1; see LICENCE.md.
 
 use std::{
-    fmt,
     ffi::{CStr, c_void},
-    mem,
+    fmt, mem,
 };
 
 use anyhow::Result;
@@ -17,7 +16,8 @@ use windows_sys::Win32::System::{
     },
     SystemInformation::{IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_I386},
     SystemServices::{
-        IMAGE_DOS_HEADER, IMAGE_DOS_SIGNATURE, IMAGE_IMPORT_DESCRIPTOR, IMAGE_NT_SIGNATURE, IMAGE_ORDINAL_FLAG32, IMAGE_ORDINAL_FLAG64
+        IMAGE_DOS_HEADER, IMAGE_DOS_SIGNATURE, IMAGE_IMPORT_DESCRIPTOR, IMAGE_NT_SIGNATURE,
+        IMAGE_ORDINAL_FLAG32, IMAGE_ORDINAL_FLAG64,
     },
 };
 

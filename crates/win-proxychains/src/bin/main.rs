@@ -2,8 +2,10 @@
 // Part of the win-proxychains project. Licensed under BSL-1.1; see LICENCE.md.
 
 use std::{
+    env,
     ffi::CString,
     ffi::{OsStr, OsString},
+    os::windows::ffi::{OsStrExt, OsStringExt},
     path::{Path, PathBuf},
 };
 
@@ -15,7 +17,11 @@ use win_proxychains_dll::{
     config::{ProxychainsConfig, SAMPLE_PROXYCHAINS_CONFIG},
     map_pe::{custom_get_proc_address, map_and_load_pe},
 };
-use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, LoadLibraryA};
+use windows_sys::Win32::{
+    Foundation::LocalFree,
+    System::LibraryLoader::{GetModuleHandleA, LoadLibraryA},
+    UI::Shell::CommandLineToArgvW,
+};
 
 const DEBUG_MODE: &str = "debug";
 const DEFAULT_CONFIG_NAME: &str = "proxychains.conf";
@@ -23,10 +29,8 @@ const CONFIG_ENV_VAR: &str = "WIN_PROXYCHAINS_CONFIG";
 const INITIALIZE_SUCCESS: u32 = 1;
 const DLL_CANDIDATE_NAMES: [&str; 2] = ["win_proxychains_dll.dll", "win_proxychains.dll"];
 const CLI_ABOUT: &str = "Windows proxychains-style launcher from the win-proxychains project.";
-const CLI_NOTICE: &str =
-    "Part of the win-proxychains project by FractalFrame (https://fractalframe.eu). Licensed under BSL-1.1; see LICENCE.md.";
-const DEBUG_AFTER_HELP: &str =
-    "Debug mode accepts debug-only flags before <program>.\n\nPart of the win-proxychains project by FractalFrame (https://fractalframe.eu). Licensed under BSL-1.1; see LICENCE.md.";
+const CLI_NOTICE: &str = "Part of the win-proxychains project by FractalFrame (https://fractalframe.eu). Licensed under BSL-1.1; see LICENCE.md.";
+const DEBUG_AFTER_HELP: &str = "Debug mode accepts debug-only flags before <program>.\n\nPart of the win-proxychains project by FractalFrame (https://fractalframe.eu). Licensed under BSL-1.1; see LICENCE.md.";
 
 fn main() {
     match run() {
@@ -384,14 +388,18 @@ impl Cli {
                 .chain(raw_args.iter().skip(2).cloned())
                 .collect::<Vec<_>>();
             let parsed = DebugCli::try_parse_from(debug_args)?;
+            let (program, args) = normalize_command(parsed.command.program, parsed.command.args)
+                .map_err(|error| {
+                    clap::Error::raw(clap::error::ErrorKind::InvalidValue, error.to_string())
+                })?;
 
             Ok(Self {
                 mode: Mode::Debug,
                 quiet: parsed.options.quiet,
                 write_config: parsed.options.write_config,
                 config: parsed.options.config,
-                program: parsed.command.program,
-                args: parsed.command.args,
+                program,
+                args,
                 debug: parsed.debug,
             })
         } else {
@@ -402,17 +410,167 @@ impl Cli {
                     "proxychains mode requires a program to launch",
                 ));
             }
+            let (program, args) = normalize_command(parsed.command.program, parsed.command.args)
+                .map_err(|error| {
+                    clap::Error::raw(clap::error::ErrorKind::InvalidValue, error.to_string())
+                })?;
 
             Ok(Self {
                 mode: Mode::Proxychains,
                 quiet: parsed.options.quiet,
                 write_config: parsed.options.write_config,
                 config: parsed.options.config,
-                program: parsed.command.program,
-                args: parsed.command.args,
+                program,
+                args,
                 debug: DebugOptions::default(),
             })
         }
+    }
+}
+
+fn normalize_command(
+    program: Option<OsString>,
+    args: Vec<OsString>,
+) -> Result<(Option<OsString>, Vec<OsString>)> {
+    if !args.is_empty() {
+        return Ok((program, args));
+    }
+
+    let Some(program) = program else {
+        return Ok((None, args));
+    };
+
+    if let Some((program, args)) = split_embedded_command(&program)? {
+        return Ok((Some(program), args));
+    }
+
+    Ok((Some(program), args))
+}
+
+fn split_embedded_command(command: &OsStr) -> Result<Option<(OsString, Vec<OsString>)>> {
+    let command = command.to_string_lossy();
+    let command = command.trim();
+    if command.is_empty() || !command.chars().any(|ch| ch.is_whitespace()) {
+        return Ok(None);
+    }
+
+    if resolves_to_executable(OsStr::new(command)) {
+        return Ok(None);
+    }
+
+    let split_points = command
+        .char_indices()
+        .filter_map(|(index, ch)| ch.is_whitespace().then_some(index))
+        .collect::<Vec<_>>();
+
+    for split_index in split_points.into_iter().rev() {
+        let candidate = command[..split_index].trim_end();
+        if candidate.is_empty() || !resolves_to_executable(OsStr::new(candidate)) {
+            continue;
+        }
+
+        let remainder = command[split_index..].trim_start();
+        let args = parse_windows_arguments(remainder)?;
+        return Ok(Some((OsString::from(candidate), args)));
+    }
+
+    Ok(None)
+}
+
+fn resolves_to_executable(candidate: &OsStr) -> bool {
+    let candidate_path = Path::new(candidate);
+    if candidate_path.is_file() {
+        return true;
+    }
+
+    let candidate = candidate.to_string_lossy();
+    if candidate.is_empty() || is_path_like(&candidate) {
+        return false;
+    }
+
+    search_path_for_executable(OsStr::new(candidate.as_ref()))
+}
+
+fn is_path_like(candidate: &str) -> bool {
+    candidate.starts_with('.')
+        || candidate.contains('\\')
+        || candidate.contains('/')
+        || candidate.contains(':')
+}
+
+fn search_path_for_executable(candidate: &OsStr) -> bool {
+    let has_extension = Path::new(candidate).extension().is_some();
+    let path_exts = executable_extensions();
+
+    env::var_os("PATH").is_some_and(|path| {
+        env::split_paths(&path).any(|directory| {
+            if has_extension {
+                directory.join(candidate).is_file()
+            } else {
+                path_exts.iter().any(|extension| {
+                    let mut file_name = candidate.to_os_string();
+                    file_name.push(extension);
+                    directory.join(&file_name).is_file()
+                })
+            }
+        })
+    })
+}
+
+fn executable_extensions() -> Vec<OsString> {
+    const DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD";
+
+    env::var_os("PATHEXT")
+        .and_then(|extensions| {
+            let parsed = env::split_paths(&extensions)
+                .filter(|extension| !extension.as_os_str().is_empty())
+                .map(|extension| extension.into_os_string())
+                .collect::<Vec<_>>();
+            (!parsed.is_empty()).then_some(parsed)
+        })
+        .unwrap_or_else(|| {
+            DEFAULT_PATHEXT
+                .split(';')
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        })
+}
+
+fn parse_windows_arguments(command_line: &str) -> Result<Vec<OsString>> {
+    if command_line.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut command_line_wide = OsStr::new(command_line).encode_wide().collect::<Vec<_>>();
+    command_line_wide.push(0);
+
+    let mut argc = 0i32;
+    let argv = unsafe { CommandLineToArgvW(command_line_wide.as_ptr(), &mut argc) };
+    if argv.is_null() {
+        anyhow::bail!("failed to parse embedded command line arguments");
+    }
+
+    let argv_slice = unsafe { std::slice::from_raw_parts(argv, argc as usize) };
+    let args = argv_slice
+        .iter()
+        .map(|argument| os_string_from_wide_ptr(*argument))
+        .collect::<Vec<_>>();
+
+    unsafe {
+        LocalFree(argv as _);
+    }
+
+    Ok(args)
+}
+
+fn os_string_from_wide_ptr(ptr: *mut u16) -> OsString {
+    let mut len = 0usize;
+    unsafe {
+        while *ptr.add(len) != 0 {
+            len += 1;
+        }
+
+        OsString::from_wide(std::slice::from_raw_parts(ptr, len))
     }
 }
 
@@ -448,7 +606,7 @@ fn load_pe_in_current_process(path: &Path) -> Result<(u64, MemorySection)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, CONFIG_ENV_VAR, Mode, resolve_config_path, resolve_proxychains_dll_path,
+        CONFIG_ENV_VAR, Cli, Mode, resolve_config_path, resolve_proxychains_dll_path,
         write_sample_config,
     };
     use std::{
@@ -528,6 +686,78 @@ mod tests {
         assert_eq!(cli.debug.load_pe, Some("my-hook.dll".into()));
         assert_eq!(cli.program, Some(OsString::from("curl")));
         assert_eq!(cli.args, vec![OsString::from("--silent")]);
+    }
+
+    #[test]
+    fn preserves_single_argument_program_path_with_spaces() {
+        let temp_dir = unique_temp_dir("program-with-spaces");
+        let program_dir = temp_dir.join("Program Files");
+        fs::create_dir_all(&program_dir).expect("program dir should be created");
+
+        let program_path = program_dir.join("tool.exe");
+        fs::write(&program_path, b"").expect("program placeholder should be written");
+
+        let cli = Cli::try_parse_from([
+            OsString::from("win-proxychains"),
+            program_path.as_os_str().to_os_string(),
+        ])
+        .expect("single program path should parse");
+
+        assert_eq!(cli.program, Some(program_path.as_os_str().to_os_string()));
+        assert!(cli.args.is_empty());
+
+        fs::remove_dir_all(&temp_dir).expect("temp dir should be cleaned up");
+    }
+
+    #[test]
+    fn splits_single_string_command_line_at_longest_existing_path_prefix() {
+        let temp_dir = unique_temp_dir("embedded-command-path");
+        let program_dir = temp_dir.join("Program Files");
+        fs::create_dir_all(&program_dir).expect("program dir should be created");
+
+        let program_path = program_dir.join("tool.exe");
+        fs::write(&program_path, b"").expect("program placeholder should be written");
+
+        let embedded_command = format!(
+            "{} --silent https://example.com",
+            program_path.to_string_lossy()
+        );
+        let cli = Cli::try_parse_from([
+            OsString::from("win-proxychains"),
+            OsString::from(embedded_command),
+        ])
+        .expect("embedded command should parse");
+
+        assert_eq!(cli.program, Some(program_path.as_os_str().to_os_string()));
+        assert_eq!(
+            cli.args,
+            vec![
+                OsString::from("--silent"),
+                OsString::from("https://example.com"),
+            ]
+        );
+
+        fs::remove_dir_all(&temp_dir).expect("temp dir should be cleaned up");
+    }
+
+    #[test]
+    fn splits_single_string_command_line_using_path_search() {
+        let cli = Cli::try_parse_from([
+            "win-proxychains",
+            "powershell -c iwr -UseBasicParsing https://google.com/",
+        ])
+        .expect("embedded command should parse");
+
+        assert_eq!(cli.program, Some(OsString::from("powershell")));
+        assert_eq!(
+            cli.args,
+            vec![
+                OsString::from("-c"),
+                OsString::from("iwr"),
+                OsString::from("-UseBasicParsing"),
+                OsString::from("https://google.com/"),
+            ]
+        );
     }
 
     #[test]
@@ -673,9 +903,9 @@ mod tests {
         let error = resolve_config_path(None, &exe_path)
             .expect_err("missing env config path should be rejected");
         assert!(
-            error
-                .to_string()
-                .contains("config path from WIN_PROXYCHAINS_CONFIG does not point to a readable file"),
+            error.to_string().contains(
+                "config path from WIN_PROXYCHAINS_CONFIG does not point to a readable file"
+            ),
             "unexpected error: {error:#}"
         );
 

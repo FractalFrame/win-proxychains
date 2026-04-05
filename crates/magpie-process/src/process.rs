@@ -894,7 +894,8 @@ impl ModuleInfo {
             .read_memory_at(self.base_address, image_size)?
             .into_boxed_slice();
         let parsed = ParsedPeFile::parse(&backing)?;
-        let parsed = unsafe { std::mem::transmute::<ParsedPeFile<'_>, ParsedPeFile<'static>>(parsed) };
+        let parsed =
+            unsafe { std::mem::transmute::<ParsedPeFile<'_>, ParsedPeFile<'static>>(parsed) };
 
         Ok(AnalysedModuleInfo {
             module: ModuleInfo {

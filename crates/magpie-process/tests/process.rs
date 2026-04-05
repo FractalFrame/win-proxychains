@@ -11,7 +11,9 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use magpie_process::{MemoryInfo, MemorySection, ModuleInfo, Process, ProcessBuilder, SectionTable};
+use magpie_process::{
+    MemoryInfo, MemorySection, ModuleInfo, Process, ProcessBuilder, SectionTable,
+};
 use windows_sys::Win32::System::Memory::{
     PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOCACHE,
     PAGE_READONLY, PAGE_READWRITE, PAGE_TARGETS_INVALID, PAGE_WRITECOMBINE, SECTION_MAP_EXECUTE,

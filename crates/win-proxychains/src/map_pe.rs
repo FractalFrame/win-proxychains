@@ -1,18 +1,11 @@
 use anyhow::Result;
 use magpie_process::{MemorySection, ParsedNtHeaders, ParsedPeFile, Process};
-use std::{
-    ffi::CString,
-    mem,
-    path::Path,
-};
+use std::{ffi::CString, mem, path::Path};
+use windows_sys::Win32::System::Memory::PAGE_EXECUTE_WRITECOPY;
 use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
 use windows_sys::Win32::System::SystemServices::{
-    DLL_PROCESS_ATTACH, IMAGE_BASE_RELOCATION, IMAGE_EXPORT_DIRECTORY,
-    IMAGE_REL_BASED_ABSOLUTE, IMAGE_REL_BASED_DIR64, IMAGE_REL_BASED_HIGHLOW,
-    IMAGE_TLS_DIRECTORY32, IMAGE_TLS_DIRECTORY64,
-};
-use windows_sys::Win32::System::{
-    Memory::PAGE_EXECUTE_WRITECOPY,
+    DLL_PROCESS_ATTACH, IMAGE_BASE_RELOCATION, IMAGE_EXPORT_DIRECTORY, IMAGE_REL_BASED_ABSOLUTE,
+    IMAGE_REL_BASED_DIR64, IMAGE_REL_BASED_HIGHLOW, IMAGE_TLS_DIRECTORY32, IMAGE_TLS_DIRECTORY64,
 };
 use windows_sys::Win32::System::{
     LibraryLoader::{GetProcAddress, LoadLibraryA},
