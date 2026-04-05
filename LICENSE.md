@@ -42,16 +42,11 @@ service that:
 3. offering a product or service that substantially replicates the functionality
    of the Software and is marketed as a replacement for it.
 
-Permitted Purposes specifically include using the Software:
-
-1. for your internal use and access;
-
-2. for non-commercial education;
-
-3. for non-commercial research; and
-
-4. in connection with professional services that you provide to a licensee
-   using the Software in accordance with these Terms and Conditions.
+Permitted Purposes specifically include using the Software for your internal business
+purposes, including in the course of providing commercial professional services,
+consulting services, advisory services, managed services, and other services to your
+clients, whether or not those services relate to the functionality of the Software,
+provided that such use does not constitute a Competing Use.
 
 ### Patents
 
