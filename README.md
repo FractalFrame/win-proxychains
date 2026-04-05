@@ -42,6 +42,8 @@ The DNS leakage gap is as follows:
 | DnsQueryEx                | ❌      |
 | DNS Over HTTP (DOH)       | ❌      |
 
+Configuration of a "leak free" win-proxychains setup is out of scope for this project.
+
 ## Anti-virus warnings
 
 Win-proxychains uses invasive process injection techniques to hook the interface between the target program and Window's socket implementation. In this case these techniques are intended to inject proxies of your choosing between the target application and whatever TCP ports its trying to connect to, and will not harm your computer or your files. However, these techniques are also employed by malware and make the behavior of win-proxychains appear malicious to anti-virus and anti-malware products. These products may flag win-proxychains as malware or as a virus. 
