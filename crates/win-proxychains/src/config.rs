@@ -109,9 +109,8 @@ localnet 127.0.0.0/255.0.0.0
 #	        http	192.168.39.93	8080	
 #		
 #
-#       proxy types: http, socks4, socks5, raw
-#        * raw: The traffic is simply forwarded to the proxy without modification.
-#        ( auth types supported: "basic"-http  "user/pass"-socks )
+#       proxy types: socks4, socks5
+#        ( auth types supported: "user/pass"-socks )
 #
 [ProxyList]
 # add proxy here ...
