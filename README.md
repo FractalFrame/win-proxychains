@@ -20,8 +20,8 @@ win-proxychains.exe -c default_config.conf
 
 To build `win-proxychains` you need at least:
 
-- rustc 1.92.0-nightly (4645a7988 2025-09-17)
-- cargo 1.92.0-nightly (966f94733 2025-09-16)
+- rustc 1.85
+- cargo 1.85
 
 You can use the following command in the root of the repository to build:
 
