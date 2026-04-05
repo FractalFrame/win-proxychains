@@ -37,14 +37,13 @@ win-proxychains.exe -c default_config.conf
 
 The DNS leakage gap is as follows:
 
-| Feature                   | Support |
+| DNS resolving mechanism   | Support |
 |---------------------------|---------|
 | gethostbyname             | ✅      |
 | WSAAsyncGetHostByName     | ✅      |
 | getaddrinfo               | ✅      |
 | GetAddrInfoW              | ✅      |
 | GetAddrInfoExA/W          | ❌      |
-| FreeAddrInfoExA/W         | ❌      |
 | DnsQuery_A/W/UTF8         | ❌      |
 | DnsQueryEx                | ❌      |
 | DNS Over HTTP (DOH)       | ❌      |
