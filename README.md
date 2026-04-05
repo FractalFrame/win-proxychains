@@ -1,6 +1,6 @@
 # win-proxychains
 
-`win-proxychains` is a clone of [`proxychains`](https://github.com/haad/proxychains) for Windows developed and maintained by [Fractal Frame](https://fractalframe.eu).
+`win-proxychains` is a clone of [`proxychains`](https://github.com/haad/proxychains) for Windows developed and maintained by [FractalFrame](https://fractalframe.eu).
 
 While `win-proxychains` preserves the core concepts and goals of the original `proxychains`, the implementation and architecture differ significantly due to platform differences (Linux v.s. Windows) and the resulting design decisions. 
 
@@ -61,6 +61,6 @@ To be clear: `win-proxychains` is not malware, or a virus, and does not contain 
 
 ## License
 
-Copyright (c) 2026 Fractal Frame BV
+Copyright (c) 2026 FractalFrame BV
 
 This project is licensed under the FSL-1.1-MIT License, see the LICENCE.md file for details.
