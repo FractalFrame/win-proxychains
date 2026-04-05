@@ -1,107 +1,79 @@
-# Functional Source License, Version 1.1, MIT Future License
+# Business Source License 1.1
 
-## Abbreviation
+License text copyright (c) 2020 MariaDB Corporation Ab, All Rights Reserved.
 
-FSL-1.1-MIT
+"Business Source License" is a trademark of MariaDB Corporation Ab.
 
-## Notice
+## Licensor
 
-Copyright 2026 FractalFrame BV
+FractalFrame BV
 
-## Terms and Conditions
+## Licensed Work
 
-### Licensor ("We")
+win-proxychains
 
-The party offering the Software under these Terms and Conditions.
+## Additional Use Grant
 
-### The Software
+You may use the Licensed Work in production for your internal business purposes,
+including in the course of providing commercial professional services, consulting
+services, advisory services, managed services, and other services to clients.
 
-The "Software" is each version of the software that we make available under
-these Terms and Conditions, as indicated by our inclusion of these Terms and
-Conditions with the Software.
+You may distribute the Licensed Work, with or without other software, free of
+charge, including as part of a free installer, downloader, or software suite,
+provided that no fee or other monetary consideration is required as a condition
+of accessing, downloading, installing, using, or receiving the Licensed Work.
 
-### License Grant
+You may not distribute, sublicense, host, embed, package, resell, or otherwise
+make the Licensed Work available to third parties on a paid basis, including as
+part of a paid software suite, subscription, marketplace, OEM offering, reseller
+offering, hosted service, or managed service.
 
-Subject to your compliance with this License Grant and the Patents,
-Redistribution and Trademark clauses below, we hereby grant you the right to
-use, copy, modify, create derivative works, publicly perform, publicly display
-and redistribute the Software for any Permitted Purpose identified below.
+You may not offer a paid product or service that substantially replicates the
+functionality of the Licensed Work and is marketed as a replacement for it.
 
-### Permitted Purpose
+## Change Date
 
-A Permitted Purpose is any purpose other than a Competing Use. A Competing Use
-means making the Software available to others in a commercial product or
-service that:
+Four years from the date the Licensed Work is published
 
-1. substitutes for the Software;
+## Change License
 
-2. distributing, sublicensing, or otherwise making the Software available as a
-   stand-alone product or as part of a product or service whose primary purpose
-   is to provide access to the Software; or
+MIT
 
-3. offering a product or service that substantially replicates the functionality
-   of the Software and is marketed as a replacement for it.
+# Terms
 
-Permitted Purposes specifically include using the Software for your internal business
-purposes, including in the course of providing commercial professional services,
-consulting services, advisory services, managed services, and other services to your
-clients, whether or not those services relate to the functionality of the Software,
-provided that such use does not constitute a Competing Use.
+The Licensor hereby grants you the right to copy, modify, create derivative works,
+redistribute, and make non-production use of the Licensed Work. The Licensor may
+make an Additional Use Grant, above, permitting limited production use.
 
-### Patents
+Effective on the Change Date, or the fourth anniversary of the first publicly
+available distribution of a specific version of the Licensed Work under this
+License, whichever comes first, the Licensor hereby grants you rights under the
+terms of the Change License, and the rights granted in the paragraph above terminate.
 
-To the extent your use for a Permitted Purpose would necessarily infringe our
-patents, the license grant above includes a license under our patents. If you
-make a claim against any party that the Software infringes or contributes to
-the infringement of any patent, then your patent license to the Software ends
-immediately.
+If your use of the Licensed Work does not comply with the requirements currently
+in effect as described in this License, you must purchase a commercial license
+from the Licensor, its affiliated entities, or authorized resellers, or you must
+refrain from using the Licensed Work.
 
-### Redistribution
+All copies of the original and modified Licensed Work, and derivative works of
+the Licensed Work, are subject to this License. This License applies separately
+for each version of the Licensed Work and the Change Date may vary for each
+version of the Licensed Work released by Licensor.
 
-The Terms and Conditions apply to all copies, modifications and derivatives of
-the Software.
+You must conspicuously display this License on each original or modified copy of
+the Licensed Work. If you receive the Licensed Work in original or modified form
+from a third party, the terms and conditions set forth in this License apply to
+your use of that work.
 
-If you redistribute any copies, modifications or derivatives of the Software,
-you must include a copy of or a link to these Terms and Conditions and not
-remove any copyright notices provided in or with the Software.
+Any use of the Licensed Work in violation of this License will automatically
+terminate your rights under this License for the current and all other versions
+of the Licensed Work.
 
-### Disclaimer
+This License does not grant you any right in any trademark or logo of Licensor
+or its affiliates (provided that you may use a trademark or logo of Licensor as
+expressly required by this License).
 
-THE SOFTWARE IS PROVIDED "AS IS" AND WITHOUT WARRANTIES OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING WITHOUT LIMITATION WARRANTIES OF FITNESS FOR A PARTICULAR
-PURPOSE, MERCHANTABILITY, TITLE OR NON-INFRINGEMENT.
-
-IN NO EVENT WILL WE HAVE ANY LIABILITY TO YOU ARISING OUT OF OR RELATED TO THE
-SOFTWARE, INCLUDING INDIRECT, SPECIAL, INCIDENTAL OR CONSEQUENTIAL DAMAGES,
-EVEN IF WE HAVE BEEN INFORMED OF THEIR POSSIBILITY IN ADVANCE.
-
-### Trademarks
-
-Except for displaying the License Details and identifying us as the origin of
-the Software, you have no right under these Terms and Conditions to use our
-trademarks, trade names, service marks or product names.
-
-## Grant of Future License
-
-We hereby irrevocably grant you an additional license to use the Software under
-the MIT license that is effective on the tenth anniversary of the date we make
-the Software available. On or after that date, you may use the Software under
-the MIT license, in which case the following will apply:
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of
-this software and associated documentation files (the "Software"), to deal in
-the Software without restriction, including without limitation the rights to
-use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
-of the Software, and to permit persons to whom the Software is furnished to do
-so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+TO THE EXTENT PERMITTED BY APPLICABLE LAW, THE LICENSED WORK IS PROVIDED ON AN
+"AS IS" BASIS. LICENSOR HEREBY DISCLAIMS ALL WARRANTIES AND CONDITIONS, EXPRESS
+OR IMPLIED, INCLUDING (WITHOUT LIMITATION) WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE, NON-INFRINGEMENT, AND TITLE.
