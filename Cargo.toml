@@ -1,0 +1,15 @@
+[workspace]
+members = ["crates/magpie-process", "crates/win-proxychains"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+[workspace.dependencies]
+clap = { version = "4.5", features = ["derive"] }
+iced-x86 = "1.21.0"
+magpie-process = { path = "crates/magpie-process" }
+anyhow = "*"
+windows-sys = "0.61.2"
