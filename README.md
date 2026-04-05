@@ -47,7 +47,7 @@ cargo build --release
 
 ## Opsec notice
 
-**DO NOT** rely on `win-proxychains` to fully prevent leakage of DNS requests. Due large surface of the DNS resolving infrastructure in Windows, only a best effort attempt was made to implement `proxy_dns` mode. Several known avenues of DNS leakage remain due to implementation complexity. Applications written to use these APIs or mechanisms to resolve DNS names *will* leak DNS traffic on your local interfaces. *If opsec is important `win-proxychains` must be used with additional measures to ensure an airgap*.
+**DO NOT** rely on `win-proxychains` to fully prevent leakage of DNS requests. Due to the large number of ways in which DNS resolving can happen in Windows, only a best effort attempt was made to implement `proxy_dns` mode. Several known avenues of DNS leakage remain due to implementation complexity. Applications written to use these APIs or mechanisms to resolve DNS names *will* leak DNS traffic on your local interfaces. *If opsec is important `win-proxychains` must be used with additional measures to ensure an airgap*.
 
 The DNS leakage gap is as follows:
 
