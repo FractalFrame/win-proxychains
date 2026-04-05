@@ -21,16 +21,14 @@ To be clear: win-proxychains is not malware, or a virus, and does not contain ma
 
 ## Scope
 
-This project is not a drop-in replacement for the original project. win-proxychains supports:
-- proxy_dns
-- strict chains
-- dynamic chains
-- random chains
-- socks4 and socks5 proxy servers
-
-win-proxychains does not support:
-- dnat
-- raw proxies
-- http proxies
-
-Implementation details 
+| Feature              | Support |
+|----------------------|---------|
+| strict chains        | ✅      |
+| dynamic chains       | ✅      |
+| random chains        | ✅      |
+| socks4 proxy         | ✅      |
+| socks5 proxy         | ✅      |
+| proxy_dns            | 〰️      |
+| dnat                 | ❌      |
+| raw proxies          | ❌      |
+| http proxies         | ❌      |
