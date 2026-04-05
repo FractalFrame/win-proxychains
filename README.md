@@ -24,7 +24,7 @@ Example:
 
 `win-proxychains` may look for the config path set in `WIN_PROXYCHAINS_CONFIG` if no config is supplied as an argument.
 
-*note* the timeout mechanism in `win-proxychains` works differently from that of `proxychains` because `win-proxychains` aims to support blocking and nonblocking sockets. For good performance, set your timeouts as low as possible. Higher values will perform badly, especially for asynchronous connections. A good timeout is 500ms or less, and 250 if your connection has a general low latency.
+*Note:* the timeout mechanism in `win-proxychains` works differently from that of `proxychains` because `win-proxychains` aims to support blocking and nonblocking sockets. For good performance, set your timeouts as low as possible. Higher values will perform badly, especially for asynchronous connections. A good timeout is 500ms or less, and 250 if your connection has a general low latency. The timeout values in the default configuration are too high for usage with ordinary socks proxies, you should change them.
 
 To build `win-proxychains` you need at least:
 
