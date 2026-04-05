@@ -52,9 +52,9 @@ Configuration of a "leak free" `win-proxychains` setup is out of scope for this 
 
 ## Anti-virus warnings
 
-`win-proxychains` uses invasive process injection techniques to hook the interface between the target program and Windows' socket implementation. The techniques are used to inject proxies of your choosing between the target application and whatever TCP ports it's trying to connect to, and will not harm your computer or your files. However, these techniques are also employed by malware and make the behavior of win-proxychains appear malicious to anti-virus and anti-malware products. These products may flag win-proxychains as malware or as a virus. 
+`win-proxychains` uses invasive process injection techniques to hook the interface between the target program and Windows' socket implementation. The techniques are used to inject proxies of your choosing between the target application and whatever TCP ports it's trying to connect to, and will not harm your computer or your files. However, these techniques are also employed by malware and make the behavior of `win-proxychains` appear malicious to anti-virus and anti-malware products. These products may flag `win-proxychains` as malware or as a virus. 
 
-To be clear: win-proxychains is not malware, or a virus, and does not contain malicious code. It only appears to behave as such to anti-virus products.
+To be clear: `win-proxychains` is not malware, or a virus, and does not contain malicious code.
 
 ## License
 
