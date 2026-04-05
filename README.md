@@ -28,7 +28,7 @@ To be clear: win-proxychains is not malware, or a virus, and does not contain ma
 | random chains        | ✅      |
 | socks4 proxy         | ✅      |
 | socks5 proxy         | ✅      |
-| proxy_dns            | 〰️      |
+| proxy_dns            | ⚠️      |
 | dnat                 | ❌      |
 | raw proxies          | ❌      |
 | http proxies         | ❌      |
