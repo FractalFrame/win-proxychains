@@ -6,7 +6,7 @@ FSL-1.1-MIT
 
 ## Notice
 
-Copyright 2026 Fractal Frame BV
+Copyright 2026 FractalFrame BV
 
 ## Terms and Conditions
 
