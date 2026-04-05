@@ -1,5 +1,5 @@
 // Copyright (c) 2026 FractalFrame <https://fractalframe.eu>
-// Part of the win-proxychains project. Licensed under FSL-1.1-MIT; see LICENCE.md.
+// Part of the win-proxychains project. Licensed under BSL-1.1; see LICENCE.md.
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, INVALID_HANDLE_VALUE,

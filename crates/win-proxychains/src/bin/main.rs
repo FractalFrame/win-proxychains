@@ -1,5 +1,5 @@
 // Copyright (c) 2026 FractalFrame <https://fractalframe.eu>
-// Part of the win-proxychains project. Licensed under FSL-1.1-MIT; see LICENCE.md.
+// Part of the win-proxychains project. Licensed under BSL-1.1; see LICENCE.md.
 
 use std::{
     ffi::CString,
@@ -24,9 +24,9 @@ const INITIALIZE_SUCCESS: u32 = 1;
 const DLL_CANDIDATE_NAMES: [&str; 2] = ["win_proxychains_dll.dll", "win_proxychains.dll"];
 const CLI_ABOUT: &str = "Windows proxychains-style launcher from the win-proxychains project.";
 const CLI_NOTICE: &str =
-    "Part of the win-proxychains project by FractalFrame (https://fractalframe.eu). Licensed under FSL-1.1-MIT; see LICENCE.md.";
+    "Part of the win-proxychains project by FractalFrame (https://fractalframe.eu). Licensed under BSL-1.1; see LICENCE.md.";
 const DEBUG_AFTER_HELP: &str =
-    "Debug mode accepts debug-only flags before <program>.\n\nPart of the win-proxychains project by FractalFrame (https://fractalframe.eu). Licensed under FSL-1.1-MIT; see LICENCE.md.";
+    "Debug mode accepts debug-only flags before <program>.\n\nPart of the win-proxychains project by FractalFrame (https://fractalframe.eu). Licensed under BSL-1.1; see LICENCE.md.";
 
 fn main() {
     match run() {

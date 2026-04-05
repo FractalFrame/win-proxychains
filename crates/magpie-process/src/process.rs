@@ -1,5 +1,5 @@
 // Copyright (c) 2026 FractalFrame <https://fractalframe.eu>
-// Part of the win-proxychains project. Licensed under FSL-1.1-MIT; see LICENCE.md.
+// Part of the win-proxychains project. Licensed under BSL-1.1; see LICENCE.md.
 
 use std::{
     cmp::Ordering,
