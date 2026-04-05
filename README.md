@@ -40,7 +40,6 @@ The DNS leakage gap is as follows:
 | FreeAddrInfoExA/W         | ❌      |
 | DnsQuery_A/W/UTF8         | ❌      |
 | DnsQueryEx                | ❌      |
-| DnsCancelQuery            | ❌      |
 | DNS Over HTTP (DOH)       | ❌      |
 
 ## Anti-virus warnings
