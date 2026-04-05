@@ -1,8 +1,8 @@
 # win-proxychains
 
-`win-proxychains` is a clone of [proxychains](https://github.com/haad/proxychains) for Windows developed and maintained by [Fractal Frame](https://fractalframe.eu).
+`win-proxychains` is a clone of [`proxychains`](https://github.com/haad/proxychains) for Windows developed and maintained by [Fractal Frame](https://fractalframe.eu).
 
-While `win-proxychains` preserves the core concepts and goals of the original proxychains, the implementation and architecture differ significantly due to platform differences (Linux v.s. Windows) and the resulting design decisions. 
+While `win-proxychains` preserves the core concepts and goals of the original `proxychains`, the implementation and architecture differ significantly due to platform differences (Linux v.s. Windows) and the resulting design decisions. 
 
 ## Usage
 
@@ -14,7 +14,7 @@ win-proxychains.exe -f <config> C:\path\to\target.exe
 win-proxychains.exe -c default_config.conf
 ```
 
-`win-proxychains` can parse proxychains4 configs and warns you when invalid or unsupported modes from proxychains4 are used.
+`win-proxychains` can parse `proxychains4` configs and warns you when invalid or unsupported modes from `proxychains4` are used.
 
 ## Features
 `Win-proxychains` was tested on Windows 11 and Windows 10, against firefox.exe, msedge.exe, chrome.exe, and various test programs.
