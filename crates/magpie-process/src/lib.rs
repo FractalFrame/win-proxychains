@@ -1,4 +1,4 @@
-// Copyright (c) 2026 Fractal Frame <https://fractalframe.eu>
+// Copyright (c) 2026 FractalFrame <https://fractalframe.eu>
 // Part of the win-proxychains project. Licensed under FSL-1.1-MIT; see LICENCE.md.
 
 pub mod pe_file;
