@@ -241,7 +241,7 @@ fn find_own_header() -> Result<*const c_void> {
 // It is called when our section propagates to a new process, and the remote "initialize" function is called
 #[repr(C)]
 pub struct InitializePacket {
-    pub config_slice: [u8; 0x1000],
+    pub config_slice: [u8; 0x5000],
     pub config_len: usize,
 
     pub section_name_slice: [u8; 256],
