@@ -109,8 +109,9 @@ localnet 127.0.0.0/255.0.0.0
 #	        http	192.168.39.93	8080	
 #		
 #
-#       proxy types: socks4, socks5
-#        ( auth types supported: "user/pass"-socks )
+#       proxy types: http, socks4, socks5, raw
+#        * raw: The traffic is simply forwarded to the proxy without modification.
+#        ( auth types supported: "basic"-http  "user/pass"-socks )
 #
 [ProxyList]
 # add proxy here ...
@@ -638,16 +639,53 @@ fn sample_random_chain(
         .hash(&mut seed_hasher);
     let mut seed = seed_hasher.finish();
 
+    let requires_non_socks4_exit = target.is_ipv6();
     let mut indices = (0..proxies.len()).collect::<Vec<_>>();
-    for i in 0..chain_len {
+    let mut sampled_indices = Vec::with_capacity(chain_len);
+
+    if requires_non_socks4_exit {
+        let exit_candidates = indices
+            .iter()
+            .copied()
+            .filter(|&index| proxies[index].proxy_type != ProxyType::Socks4)
+            .collect::<Vec<_>>();
+        ensure!(
+            !exit_candidates.is_empty(),
+            "random proxy chain for IPv6 destination {target} requires at least one non-SOCKS4 exit proxy"
+        );
+
         seed = seed
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
-        let j = i + (seed as usize % (indices.len() - i));
-        indices.swap(i, j);
+        let exit_index = exit_candidates[seed as usize % exit_candidates.len()];
+        let exit_position = indices
+            .iter()
+            .position(|&index| index == exit_index)
+            .expect("selected exit proxy must exist in the candidate list");
+        indices.swap_remove(exit_position);
+
+        for i in 0..(chain_len - 1) {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let j = i + (seed as usize % (indices.len() - i));
+            indices.swap(i, j);
+            sampled_indices.push(indices[i]);
+        }
+
+        sampled_indices.push(exit_index);
+    } else {
+        for i in 0..chain_len {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let j = i + (seed as usize % (indices.len() - i));
+            indices.swap(i, j);
+            sampled_indices.push(indices[i]);
+        }
     }
 
-    Ok(indices[..chain_len]
+    Ok(sampled_indices
         .iter()
         .map(|&index| proxies[index].clone())
         .collect())
@@ -1299,6 +1337,73 @@ mod tests {
 
         assert_eq!(chain.len(), 2);
         assert!(chain.iter().all(|proxy| config.proxies.contains(proxy)));
+    }
+
+    #[test]
+    fn sample_chain_never_returns_socks4_as_ipv6_random_exit() {
+        let config = ProxychainsConfig::parse(
+            "random_chain\n\
+             chain_len = 2\n\
+             [ProxyList]\n\
+             socks4 127.0.0.1 9050\n\
+             socks5 10.0.0.2 1080\n\
+             socks4 10.0.0.3 1081\n",
+        )
+        .expect("config should parse");
+
+        let address = SOCKADDR_IN6 {
+            sin6_family: AF_INET6,
+            sin6_port: 443u16.to_be(),
+            sin6_flowinfo: 0,
+            sin6_addr: IN6_ADDR {
+                u: IN6_ADDR_0 {
+                    Byte: Ipv6Addr::LOCALHOST.octets(),
+                },
+            },
+            Anonymous: SOCKADDR_IN6_0 { sin6_scope_id: 0 },
+        };
+
+        let (_name, _port, chain) = config
+            .sample_chain(
+                &address as *const SOCKADDR_IN6 as *const SOCKADDR,
+                size_of::<SOCKADDR_IN6>() as i32,
+            )
+            .expect("sampling should succeed");
+
+        assert_eq!(chain.len(), 2);
+        assert_ne!(chain.last().unwrap().proxy_type, ProxyType::Socks4);
+    }
+
+    #[test]
+    fn sample_chain_rejects_ipv6_random_chain_without_non_socks4_exit() {
+        let config = ProxychainsConfig::parse(
+            "random_chain\n\
+             chain_len = 1\n\
+             [ProxyList]\n\
+             socks4 127.0.0.1 9050\n",
+        )
+        .expect("config should parse");
+
+        let address = SOCKADDR_IN6 {
+            sin6_family: AF_INET6,
+            sin6_port: 443u16.to_be(),
+            sin6_flowinfo: 0,
+            sin6_addr: IN6_ADDR {
+                u: IN6_ADDR_0 {
+                    Byte: Ipv6Addr::LOCALHOST.octets(),
+                },
+            },
+            Anonymous: SOCKADDR_IN6_0 { sin6_scope_id: 0 },
+        };
+
+        let error = config
+            .sample_chain(
+                &address as *const SOCKADDR_IN6 as *const SOCKADDR,
+                size_of::<SOCKADDR_IN6>() as i32,
+            )
+            .expect_err("IPv6 random chains need a non-SOCKS4 exit");
+
+        assert!(format!("{error:#}").contains("requires at least one non-SOCKS4 exit proxy"));
     }
 
     #[test]
