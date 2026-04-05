@@ -266,7 +266,7 @@ impl InitializePacket {
         let config_bytes = config.as_bytes();
         let section_bytes = section.as_bytes();
         let mut packet = InitializePacket {
-            config_slice: [0; 0x1000],
+            config_slice: [0; 0x5000],
             config_len: config_bytes.len(),
             section_name_slice: [0; 256],
             section_name_len: section_bytes.len(),
