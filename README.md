@@ -14,6 +14,12 @@ win-proxychains.exe -f <config> C:\path\to\target.exe
 win-proxychains.exe -c default_config.conf
 ```
 
+Example:
+
+```
+.\win-proxychains.exe "powershell -c iwr -UseBasicParsing https://google.com/"
+```
+
 `win-proxychains` can parse `proxychains4` configs and warns you when invalid or unsupported modes from `proxychains4` are used.
 
 `win-proxychains` may look for the config path set in `WIN_PROXYCHAINS_CONFIG` if no config is supplied as an argument.
