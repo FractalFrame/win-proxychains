@@ -20,8 +20,9 @@ services, advisory services, managed services, and other services to clients.
 
 You may distribute the Licensed Work, with or without other software, free of
 charge, including as part of a free installer, downloader, or software suite,
-provided that no fee or other monetary consideration is required as a condition
-of accessing, downloading, installing, using, or receiving the Licensed Work.
+provided that no fee or other monetary or commercial consideration is required
+as a condition of accessing, downloading, installing, using, or receiving the 
+Licensed Work.
 
 You may not distribute, sublicense, host, embed, package, resell, or otherwise
 make the Licensed Work available to third parties on a paid basis, including as
