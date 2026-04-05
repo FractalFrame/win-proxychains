@@ -16,6 +16,8 @@ win-proxychains.exe -c default_config.conf
 
 `win-proxychains` can parse `proxychains4` configs and warns you when invalid or unsupported modes from `proxychains4` are used.
 
+`win-proxychains` may look for the config path set in `WIN_PROXYCHAINS_CONFIG` if no config is supplied as an argument.
+
 ## Features
 `Win-proxychains` was tested on Windows 11 and Windows 10, against firefox.exe, msedge.exe, chrome.exe, and various test programs.
 
