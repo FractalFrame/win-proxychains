@@ -32,6 +32,7 @@ win-proxychains.exe -c default_config.conf
 | dnat                 | ❌      |
 | raw proxies          | ❌      |
 | http proxies         | ❌      |
+| 32 bit support       | ❌      |
 
 ## Opsec notice
 
