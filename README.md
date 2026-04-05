@@ -10,6 +10,7 @@ win-proxychains.exe -f <config> C:\target\program\path\bin.exe
 ```
 
 ## Features
+Win-proxychains was tested on Windows 11 and Windows 10, against firefox.exe, msedge.exe, chrome.exe, and various test programs.
 
 | Feature              | Support |
 |----------------------|---------|
@@ -23,10 +24,24 @@ win-proxychains.exe -f <config> C:\target\program\path\bin.exe
 | raw proxies          | ❌      |
 | http proxies         | ❌      |
 
+## Opsec notice
 
-## Offsec notice
+**DO NOT** rely on win-proxychains to fully isolate your connection and prevent leakage of DNS requests. Due to the sprawling number of DNS resolving infrastructure in Windows only a best effort attempt was made to implement `proxy_dns` mode, several known avenues of DNS leakage remain due to implementation complexity. Applications coded to use these avenues to resolve DNS names *will* leak DNS traffic on your local interfaces. *win-proxychains should be considered as a convenience tool, not an airgap*.
 
-Notice: due to the sprawling number of DNS resolving infrastructure in Windows only a best effort attempt was made to implement `proxy_dns` mode, several known avenues of DNS leakage remain due to implementation complexity. Applications coded to use these avenues to resolve DNS names *will* leak DNS traffic on your local interfaces. **DO NOT** rely on win-proxychains to fully isolate your connection and prevent leakage of DNS requests. *win-proxychains should be considered as a convenience tool, not an airgap*.
+The DNS leakage gap is as follows:
+
+| Feature                   | Support |
+|---------------------------|---------|
+| gethostbyname             | ✅      |
+| WSAAsyncGetHostByName     | ✅      |
+| getaddrinfo               | ✅      |
+| GetAddrInfoW              | ✅      |
+| GetAddrInfoExA/W          | ❌      |
+| FreeAddrInfoExA/W         | ❌      |
+| DnsQuery_A/W/UTF8         | ❌      |
+| DnsQueryEx                | ❌      |
+| DnsCancelQuery            | ❌      |
+| DNS Over HTTP (DOH)       | ❌      |
 
 ## Anti-virus warnings
 
