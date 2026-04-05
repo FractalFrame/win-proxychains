@@ -74,4 +74,4 @@ To be clear: `win-proxychains` is not malware, or a virus, and does not contain 
 
 Copyright (c) 2026 FractalFrame BV
 
-This project is licensed under the FSL-1.1-MIT License, see the LICENCE.md file for details.
+This project is licensed under the BSL-1.1 License, see the LICENCE.md file for details.
