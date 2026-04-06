@@ -1,6 +1,7 @@
 use std::{ffi::c_void, sync::atomic::AtomicU64};
 
 use magpie_process::{MemorySection, Process};
+use std::sync::Mutex;
 use windows_sys::{
     Wdk::{
         Foundation::OBJECT_ATTRIBUTES,
@@ -19,7 +20,9 @@ use windows_sys::{
 
 use anyhow::Result;
 
-use crate::{InitializePacket, get_context, map_pe::custom_get_proc_address, set_last_error};
+use crate::{
+    InitializePacket, get_context, map_pe::custom_get_proc_address, set_last_error, trace,
+};
 
 fn resume_process_with_og_bytes(
     process: &Process,
@@ -48,6 +51,7 @@ const THREAD_CREATE_FLAGS_CREATE_SUSPENDED: u32 = 0x0000_0001;
 
 // global mutable u64 to hold some context
 static FPTR_O_NT_CREATE_USER_PROCESS: AtomicU64 = AtomicU64::new(0);
+static NT_CREATE_USER_PROCESS_LOCK: Mutex<()> = Mutex::new(());
 
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn hooked_NtCreateUserProcess(
@@ -63,6 +67,10 @@ pub unsafe extern "system" fn hooked_NtCreateUserProcess(
     create_info: *mut c_void,
     attribute_list: *mut c_void,
 ) -> i32 {
+    let _hook_guard = NT_CREATE_USER_PROCESS_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
     // check if we have the quick-call fptr already
     let fptr = FPTR_O_NT_CREATE_USER_PROCESS.load(std::sync::atomic::Ordering::SeqCst);
     if fptr == 0 {
@@ -433,6 +441,11 @@ pub unsafe extern "system" fn hooked_NtCreateUserProcess(
         // ok, return as if nothing went wrong
         return result;
     };
+    trace::log(format!(
+        "NtCreateUserProcess allocated initialize packet remote_addr={:#x} packet_size={}",
+        initialize_packet_address,
+        core::mem::size_of::<InitializePacket>(),
+    ));
 
     // Finalize the packet by setting the restore data.
     if initialize_packet
@@ -475,6 +488,10 @@ pub unsafe extern "system" fn hooked_NtCreateUserProcess(
         // ok, return as if nothing went wrong
         return result;
     }
+    trace::log(format!(
+        "NtCreateUserProcess wrote initialize packet remote_addr={:#x} config_len={} section_name_len={}",
+        initialize_packet_address, initialize_packet.config_len, initialize_packet.section_name_len,
+    ));
 
     // now we need to construct the template
     // mov rcx, addr initialze_packet

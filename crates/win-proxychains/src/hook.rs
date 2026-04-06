@@ -10,7 +10,7 @@ use windows_sys::Win32::System::{
 
 use anyhow::Result;
 
-use crate::bail_with_last_error;
+use crate::{bail_with_last_error, trace};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookStatus {
@@ -86,6 +86,11 @@ impl HookContext {
                 "Target {target:#x} is too far from original function {h_proc:#x} for a relative jump"
             ));
         }
+
+        trace::log(format!(
+            "HookContext::new module={} function={} h_proc={:#x} target={:#x}",
+            module, function, h_proc, target
+        ));
 
         Ok(Self {
             module: module.to_string(),
@@ -343,6 +348,16 @@ impl HookContext {
         self.hook_end = self.h_proc + offset as u64;
         self.original_bytes.copy_from_slice(&original_bytes);
         self.hook_status = HookStatus::Hooked;
+        trace::log(format!(
+            "HookContext::hook module={} function={} hook_start={:#x} hook_end={:#x} patch_len={} trampoline={:#x} target={:#x}",
+            self.module,
+            self.function,
+            self.hook_start,
+            self.hook_end,
+            offset,
+            self.trampoline,
+            self.target
+        ));
 
         Ok(())
     }

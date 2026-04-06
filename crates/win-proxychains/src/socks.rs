@@ -10,7 +10,7 @@ use anyhow::Result;
 use windows_sys::Win32::Networking::WinSock::{
     ADDRINFOW, AF_INET, AF_INET6, AF_UNSPEC, IN_ADDR, IN_ADDR_0, IN_ADDR_0_0, IN6_ADDR, IN6_ADDR_0,
     IPPROTO_TCP, SO_RCVTIMEO, SO_SNDTIMEO, SOCK_STREAM, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6,
-    SOCKADDR_IN6_0, SOL_SOCKET, WSAEALREADY, WSAEINPROGRESS, WSAEISCONN, WSAEWOULDBLOCK,
+    SOCKADDR_IN6_0, SOCKET, SOL_SOCKET, WSAEALREADY, WSAEINPROGRESS, WSAEISCONN, WSAEWOULDBLOCK,
     WSAGetLastError, recv, send, setsockopt,
 };
 
@@ -19,6 +19,7 @@ use crate::{
     config::{ProxyEntry, ProxyType},
     hooks_dns::{o_FreeAddrInfoW, o_GetAddrInfoW, reverse_fake_dns_name},
     hooks_sockets::o_connect,
+    trace,
 };
 
 const WINSOCK_SPIN_WAIT: Duration = Duration::from_millis(0);
@@ -73,7 +74,7 @@ fn spin_wait_with_timeout(timeout: SpinTimeout, message: impl std::fmt::Display)
 }
 
 fn receive_exact(
-    socket: u32,
+    socket: SOCKET,
     buffer: &mut [u8],
     timeout: SpinTimeout,
     timeout_context: &str,
@@ -113,7 +114,7 @@ fn receive_exact(
 }
 
 fn send_exact(
-    socket: u32,
+    socket: SOCKET,
     buffer: &[u8],
     timeout: SpinTimeout,
     timeout_context: &str,
@@ -155,7 +156,7 @@ fn send_exact(
 pub fn wrap_socket_in_single_socks4a(
     next_name: &str,
     next_port: u16,
-    socket: u32,
+    socket: SOCKET,
     proxy: &ProxyEntry,
     read_timeout_ms: Option<u64>,
 ) -> Result<()> {
@@ -222,7 +223,7 @@ pub fn wrap_socket_in_single_socks4a(
 pub fn wrap_socket_in_single_socks5(
     next_name: &str,
     next_port: u16,
-    socket: u32,
+    socket: SOCKET,
     proxy: &ProxyEntry,
     read_timeout_ms: Option<u64>,
 ) -> Result<()> {
@@ -399,7 +400,7 @@ pub fn wrap_socket_in_single_socks5(
 pub fn wrap_socket_in_single_proxy(
     next_name: &str,
     next_port: u16,
-    socket: u32,
+    socket: SOCKET,
     proxy: &ProxyEntry,
     read_timeout_ms: Option<u64>,
 ) -> Result<()> {
@@ -524,7 +525,12 @@ fn resolve_targets(name: &str, port: u16) -> Result<Vec<SocketAddr>> {
     Ok(targets)
 }
 
-pub fn connect_socket(socket: u32, name: &str, port: u16, connect_timeout_ms: u64) -> Result<()> {
+pub fn connect_socket(
+    socket: SOCKET,
+    name: &str,
+    port: u16,
+    connect_timeout_ms: u64,
+) -> Result<()> {
     // A note about proxy_dns, we _do_ leak the addresses of the proxy here
     // proxy_dns does not prevent DNS lookups for your proxies, it only prevents lookups for the final destination.
     let targets = resolve_targets(name, port)?;
@@ -554,7 +560,7 @@ pub fn connect_socket(socket: u32, name: &str, port: u16, connect_timeout_ms: u6
                 loop {
                     let connect_result = unsafe {
                         o_connect(
-                            socket as usize,
+                            socket,
                             &sockaddr as *const SOCKADDR_IN as *const SOCKADDR,
                             std::mem::size_of::<SOCKADDR_IN>() as i32,
                         )
@@ -593,7 +599,7 @@ pub fn connect_socket(socket: u32, name: &str, port: u16, connect_timeout_ms: u6
                 loop {
                     let connect_result = unsafe {
                         o_connect(
-                            socket as usize,
+                            socket,
                             &sockaddr as *const SOCKADDR_IN6 as *const SOCKADDR,
                             std::mem::size_of::<SOCKADDR_IN6>() as i32,
                         )
@@ -620,10 +626,47 @@ pub fn connect_socket(socket: u32, name: &str, port: u16, connect_timeout_ms: u6
     bail_with_socket_error(format!("Failed to connect socket to {name}:{port}"))
 }
 
+fn socket_timeout_value(timeout_ms: u64, option_name: &str) -> Result<u32> {
+    u32::try_from(timeout_ms).map_err(|_| {
+        anyhow::anyhow!(
+            "{option_name} timeout {timeout_ms}ms exceeds the 32-bit Winsock socket option range"
+        )
+    })
+}
+
+fn set_socket_timeout(
+    socket: SOCKET,
+    option_name: i32,
+    timeout_ms: u64,
+    label: &str,
+) -> Result<()> {
+    let timeout_ms = socket_timeout_value(timeout_ms, label)?;
+    trace::log(format!(
+        "setsockopt timeout socket={socket:#x} option={label} value_ms={timeout_ms} size={}",
+        size_of::<u32>()
+    ));
+
+    let timeout_ptr = &timeout_ms as *const u32 as *const u8;
+    let result = unsafe {
+        setsockopt(
+            socket,
+            SOL_SOCKET,
+            option_name,
+            timeout_ptr,
+            size_of::<u32>() as i32,
+        )
+    };
+    if result == -1 {
+        return bail_with_last_error(format!("Failed to set {label}"));
+    }
+
+    Ok(())
+}
+
 pub fn wrap_socket_in_requested_chain(
     top_level_name: &str,
     top_level_port: u16,
-    socket: u32,
+    socket: SOCKET,
     tcp_read_timeout_ms: Option<u64>,
     tcp_connect_timeout_ms: Option<u64>,
     chain: &Vec<ProxyEntry>,
@@ -631,34 +674,12 @@ pub fn wrap_socket_in_requested_chain(
 ) -> Result<()> {
     let connect_timeout_ms = tcp_connect_timeout_ms.unwrap_or(DEFAULT_TCP_CONNECT_TIMEOUT_MS);
 
-    unsafe {
-        if let Some(recv_timeout_ms) = tcp_read_timeout_ms {
-            let recv_timeout_ptr = &recv_timeout_ms as *const u64 as *const _;
-            if setsockopt(
-                socket as usize,
-                SOL_SOCKET,
-                SO_RCVTIMEO,
-                recv_timeout_ptr,
-                std::mem::size_of_val(&recv_timeout_ms) as i32,
-            ) == -1
-            {
-                return bail_with_last_error("Failed to set receive timeout");
-            }
-        }
+    if let Some(recv_timeout_ms) = tcp_read_timeout_ms {
+        set_socket_timeout(socket, SO_RCVTIMEO, recv_timeout_ms, "SO_RCVTIMEO")?;
+    }
 
-        if let Some(connect_timeout_ms) = tcp_connect_timeout_ms {
-            let send_timeout_ptr = &connect_timeout_ms as *const u64 as *const _;
-            if setsockopt(
-                socket as usize,
-                SOL_SOCKET,
-                SO_SNDTIMEO,
-                send_timeout_ptr,
-                std::mem::size_of_val(&connect_timeout_ms) as i32,
-            ) == -1
-            {
-                return bail_with_last_error("Failed to set send timeout");
-            }
-        }
+    if let Some(connect_timeout_ms) = tcp_connect_timeout_ms {
+        set_socket_timeout(socket, SO_SNDTIMEO, connect_timeout_ms, "SO_SNDTIMEO")?;
     }
 
     if chain.is_empty() {
@@ -769,8 +790,9 @@ mod tests {
     };
 
     use windows_sys::Win32::Networking::WinSock::{
-        AF_INET, AF_INET6, FIONBIO, INVALID_SOCKET, IPPROTO_TCP, SOCK_STREAM, SOCKADDR, WSADATA,
-        WSAEWOULDBLOCK, WSASetLastError, WSAStartup, closesocket, connect, ioctlsocket, socket,
+        AF_INET, AF_INET6, FIONBIO, INVALID_SOCKET, IPPROTO_TCP, SOCK_STREAM, SOCKADDR, SOCKET,
+        WSADATA, WSAEWOULDBLOCK, WSASetLastError, WSAStartup, closesocket, connect, ioctlsocket,
+        socket,
     };
 
     use super::{connect_socket, wrap_socket_in_single_socks5};
@@ -846,12 +868,7 @@ mod tests {
         let raw_socket = unsafe { socket(family, SOCK_STREAM, IPPROTO_TCP) };
         assert_ne!(raw_socket, INVALID_SOCKET, "socket creation should succeed");
 
-        let connect_result = connect_socket(
-            u32::try_from(raw_socket).expect("SOCKET handle should fit into u32"),
-            name,
-            port,
-            5000,
-        );
+        let connect_result = connect_socket(raw_socket, name, port, 5000);
 
         let close_result = unsafe { closesocket(raw_socket) };
         assert_eq!(close_result, 0, "closesocket should succeed");
@@ -928,13 +945,9 @@ mod tests {
 
         CONNECT_CALLS.store(0, Ordering::SeqCst);
         let started = Instant::now();
-        let error = connect_socket(
-            u32::try_from(raw_socket).expect("SOCKET handle should fit into u32"),
-            "127.0.0.1",
-            8080,
-            20,
-        )
-        .expect_err("connect_socket should time out when connect keeps returning WSAEWOULDBLOCK");
+        let error = connect_socket(raw_socket, "127.0.0.1", 8080, 20).expect_err(
+            "connect_socket should time out when connect keeps returning WSAEWOULDBLOCK",
+        );
 
         let close_result = unsafe { closesocket(raw_socket) };
         assert_eq!(close_result, 0, "closesocket should succeed");
@@ -994,7 +1007,7 @@ mod tests {
         let error = wrap_socket_in_single_socks5(
             "example.com",
             443,
-            u32::try_from(stream.as_raw_socket()).expect("SOCKET handle should fit into u32"),
+            stream.as_raw_socket() as SOCKET,
             &proxy,
             Some(20),
         )
@@ -1009,5 +1022,21 @@ mod tests {
         server_thread
             .join()
             .expect("server thread should not panic");
+    }
+
+    #[test]
+    fn socket_timeout_value_uses_32_bit_winsock_range() {
+        let _test_guard = TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        assert_eq!(
+            super::socket_timeout_value(20_000, "SO_RCVTIMEO").expect("20s should fit"),
+            20_000
+        );
+        assert!(
+            super::socket_timeout_value(u64::from(u32::MAX) + 1, "SO_SNDTIMEO").is_err(),
+            "timeouts above the DWORD range must be rejected before calling setsockopt"
+        );
     }
 }

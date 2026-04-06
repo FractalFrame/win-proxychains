@@ -26,6 +26,7 @@ pub mod hooks_ntdll;
 pub mod hooks_sockets;
 pub mod map_pe;
 pub mod socks;
+pub mod trace;
 
 // stati
 static CONTEXT: AtomicU64 = AtomicU64::new(0);
@@ -58,6 +59,7 @@ pub struct Context {
     // Afer 0xffffff requests, IPv4 will be dropped from that point on, only IPv6 will be generated.
     pub dns_cache: Mutex<HashMap<String, Vec<std::net::IpAddr>>>,
     pub reverse_dns_cache: Mutex<HashMap<std::net::IpAddr, String>>,
+    pub dns_hostent_storage: Mutex<HashMap<u32, Box<hooks_dns::FakeHostentStorage>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +122,7 @@ pub fn get_context() -> &'static mut Context {
                 ipv6_fake_counter: 0,
                 dns_cache: Mutex::new(HashMap::new()),
                 reverse_dns_cache: Mutex::new(HashMap::new()),
+                dns_hostent_storage: Mutex::new(HashMap::new()),
             });
             let new_context_ptr = Box::into_raw(new_context);
 
@@ -241,7 +244,7 @@ fn find_own_header() -> Result<*const c_void> {
 // It is called when our section propagates to a new process, and the remote "initialize" function is called
 #[repr(C)]
 pub struct InitializePacket {
-    pub config_slice: [u8; 0x1000],
+    pub config_slice: [u8; 0x5000],
     pub config_len: usize,
 
     pub section_name_slice: [u8; 256],
@@ -265,15 +268,10 @@ impl InitializePacket {
     pub fn new(config: &str, section: &str, section_base: u64) -> Result<Self> {
         let config_bytes = config.as_bytes();
         let section_bytes = section.as_bytes();
-        let mut packet = InitializePacket {
-            config_slice: [0; 0x1000],
-            config_len: config_bytes.len(),
-            section_name_slice: [0; 256],
-            section_name_len: section_bytes.len(),
-            section_base,
-            og_bytes: [0; 2 + 2 + 8 + 8 + 2],
-            og_entry: 0,
-        };
+        let mut packet: InitializePacket = unsafe { std::mem::zeroed() };
+        packet.config_len = config_bytes.len();
+        packet.section_name_len = section_bytes.len();
+        packet.section_base = section_base;
 
         if !config.is_empty() && config_bytes.len() <= packet.config_slice.len() {
             unsafe {
@@ -366,6 +364,14 @@ pub unsafe extern "C" fn initialize_remote(packet: *const InitializePacket) -> u
     }
 
     let packet = unsafe { &*packet };
+    // trace::log(format!(
+    //     "initialize_remote packet={:p} packet_size={} config_len={} section_name_len={} section_base={:#x}",
+    //     packet as *const InitializePacket,
+    //     std::mem::size_of::<InitializePacket>(),
+    //     packet.config_len,
+    //     packet.section_name_len,
+    //     packet.section_base,
+    // ));
 
     let res = unsafe {
         initialize(
@@ -638,13 +644,30 @@ unsafe fn initialize(
             return FAILURE;
         };
 
-        if let Err(e) = free_addr_info_w_hook.hook() {
-            let context = get_context();
-            context.last_error = format!("Failed to hook FreeAddrInfoW: {e:#}");
-            return FAILURE;
-        }
+        if let Some(existing_hook) = context.hooks.iter().find(|existing_hook| {
+            existing_hook
+                .module
+                .eq_ignore_ascii_case(&free_addr_info_w_hook.module)
+                && existing_hook.h_proc == free_addr_info_w_hook.h_proc
+        }) {
+            hooks_dns::seed_free_addr_info_w_trampoline(existing_hook.trampoline());
+            trace::log(format!(
+                "Skipping duplicate hook for {}!{} at {:#x}; reusing trampoline {:#x} from {}",
+                free_addr_info_w_hook.module,
+                free_addr_info_w_hook.function,
+                free_addr_info_w_hook.h_proc,
+                existing_hook.trampoline(),
+                existing_hook.function
+            ));
+        } else {
+            if let Err(e) = free_addr_info_w_hook.hook() {
+                let context = get_context();
+                context.last_error = format!("Failed to hook FreeAddrInfoW: {e:#}");
+                return FAILURE;
+            }
 
-        context.hooks.push(free_addr_info_w_hook);
+            context.hooks.push(free_addr_info_w_hook);
+        }
     }
 
     // hook connect to insert our socks proxies

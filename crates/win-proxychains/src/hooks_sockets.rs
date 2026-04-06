@@ -9,10 +9,10 @@ use windows_sys::{
     Win32::{
         Foundation::{HANDLE, HWND, INVALID_HANDLE_VALUE},
         Networking::WinSock::{
-            FD_CONNECT, FIONBIO, LPFN_CONNECTEX, SIO_GET_EXTENSION_FUNCTION_POINTER,
-            SO_UPDATE_CONNECT_CONTEXT, SOCKADDR, SOCKET, SOL_SOCKET, WSA_IO_PENDING, WSABUF,
-            WSAECONNABORTED, WSAEFAULT, WSAENOTSOCK, WSAEWOULDBLOCK, WSAGetLastError,
-            WSAID_CONNECTEX, WSASetLastError, send,
+            AF_INET, AF_INET6, FD_CONNECT, FIONBIO, LPFN_CONNECTEX,
+            SIO_GET_EXTENSION_FUNCTION_POINTER, SO_UPDATE_CONNECT_CONTEXT, SOCKADDR, SOCKADDR_IN,
+            SOCKADDR_IN6, SOCKET, SOL_SOCKET, WSA_IO_PENDING, WSABUF, WSAECONNABORTED, WSAEFAULT,
+            WSAENOTSOCK, WSAEWOULDBLOCK, WSAGetLastError, WSAID_CONNECTEX, WSASetLastError, send,
         },
         System::{
             IO::{OVERLAPPED, PostQueuedCompletionStatus},
@@ -27,6 +27,7 @@ use anyhow::Result;
 use crate::{
     AsyncSelectState, EventSelectState, IocpAssociationState, SocketConnectContract,
     SyntheticConnectExState, get_context, set_last_error, socks::wrap_socket_in_requested_chain,
+    trace,
 };
 
 static FPTR_O_CONNECT: AtomicU64 = AtomicU64::new(0);
@@ -255,6 +256,42 @@ fn connect_success_result(contract: SocketConnectContract) -> (i32, i32) {
     }
 }
 
+fn describe_sockaddr(address: *const SOCKADDR, address_len: i32) -> String {
+    if address.is_null() {
+        return "null".to_string();
+    }
+
+    match unsafe { (*address).sa_family as i32 } {
+        family if family == AF_INET as i32 && address_len as usize >= size_of::<SOCKADDR_IN>() => {
+            let sockaddr = unsafe { &*(address as *const SOCKADDR_IN) };
+            let octets = unsafe {
+                let octets = sockaddr.sin_addr.S_un.S_un_b;
+                [octets.s_b1, octets.s_b2, octets.s_b3, octets.s_b4]
+            };
+            format!(
+                "{}.{}.{}.{}:{}",
+                octets[0],
+                octets[1],
+                octets[2],
+                octets[3],
+                u16::from_be(sockaddr.sin_port)
+            )
+        }
+        family
+            if family == AF_INET6 as i32 && address_len as usize >= size_of::<SOCKADDR_IN6>() =>
+        {
+            let sockaddr = unsafe { &*(address as *const SOCKADDR_IN6) };
+            let octets = unsafe { sockaddr.sin6_addr.u.Byte };
+            format!(
+                "[{}]:{}",
+                std::net::Ipv6Addr::from(octets),
+                u16::from_be(sockaddr.sin6_port)
+            )
+        }
+        family => format!("family={family} len={address_len} ptr={address:p}"),
+    }
+}
+
 fn proxy_connect_socket(socket: SOCKET, address: *const SOCKADDR, address_len: i32) -> Result<()> {
     let context = get_context();
     let Some(config) = context.config.as_ref() else {
@@ -271,11 +308,16 @@ fn proxy_connect_socket(socket: SOCKET, address: *const SOCKADDR, address_len: i
             return Err(anyhow::anyhow!(message));
         }
     };
+    trace::log(format!(
+        "proxy_connect_socket socket={socket:#x} target={top_level_name}:{top_level_port} chain_len={} dynamic={}",
+        chain.len(),
+        config.chain_type == crate::config::ChainType::Dynamic,
+    ));
 
     wrap_socket_in_requested_chain(
         &top_level_name,
         top_level_port,
-        socket as u32,
+        socket,
         config.tcp_read_time_out,
         config.tcp_connect_time_out,
         &chain,
@@ -457,14 +499,25 @@ pub unsafe extern "system" fn hooked_connect(
     address: *const SOCKADDR,
     address_len: i32,
 ) -> i32 {
+    trace::log(format!(
+        "hooked_connect enter socket={socket:#x} address={}",
+        describe_sockaddr(address, address_len)
+    ));
     reset_socket_connect_tracking(socket);
 
     if proxy_connect_socket(socket, address, address_len).is_err() {
+        trace::log(format!(
+            "hooked_connect failure socket={socket:#x} error={}",
+            get_context().last_error
+        ));
         set_proxy_connect_error();
         return -1;
     }
 
     let (result, error_code) = connect_success_result(socket_connect_contract(socket));
+    trace::log(format!(
+        "hooked_connect success socket={socket:#x} result={result} wsa_error={error_code}"
+    ));
     unsafe { WSASetLastError(error_code) };
     result
 }
@@ -479,14 +532,25 @@ pub unsafe extern "system" fn hooked_WSAConnect(
     _sqos: *mut windows_sys::Win32::Networking::WinSock::QOS,
     _gqos: *mut windows_sys::Win32::Networking::WinSock::QOS,
 ) -> i32 {
+    trace::log(format!(
+        "hooked_WSAConnect enter socket={socket:#x} address={}",
+        describe_sockaddr(name, name_len)
+    ));
     reset_socket_connect_tracking(socket);
 
     if proxy_connect_socket(socket, name, name_len).is_err() {
+        trace::log(format!(
+            "hooked_WSAConnect failure socket={socket:#x} error={}",
+            get_context().last_error
+        ));
         set_proxy_connect_error();
         return -1;
     }
 
     let (result, error_code) = connect_success_result(socket_connect_contract(socket));
+    trace::log(format!(
+        "hooked_WSAConnect success socket={socket:#x} result={result} wsa_error={error_code}"
+    ));
     unsafe { WSASetLastError(error_code) };
     result
 }
@@ -754,6 +818,10 @@ pub unsafe extern "system" fn hooked_ConnectEx(
     bytes_sent: *mut u32,
     overlapped: *mut OVERLAPPED,
 ) -> BOOL {
+    trace::log(format!(
+        "hooked_ConnectEx enter socket={socket:#x} address={} overlapped={overlapped:p} send_len={send_buffer_len}",
+        describe_sockaddr(address, address_len)
+    ));
     if overlapped.is_null() {
         set_wsa_error(
             "ConnectEx requires a non-null OVERLAPPED pointer",
@@ -780,6 +848,10 @@ pub unsafe extern "system" fn hooked_ConnectEx(
             format!("ConnectEx proxy connect failed: {error:#}"),
             error_code,
         );
+        trace::log(format!(
+            "hooked_ConnectEx failure socket={socket:#x} error={}",
+            get_context().last_error
+        ));
         return 0;
     }
 
@@ -797,6 +869,10 @@ pub unsafe extern "system" fn hooked_ConnectEx(
                 format!("ConnectEx payload send failed: {error:#}"),
                 error_code,
             );
+            trace::log(format!(
+                "hooked_ConnectEx payload failure socket={socket:#x} error={}",
+                get_context().last_error
+            ));
             return 0;
         }
     };
@@ -804,6 +880,9 @@ pub unsafe extern "system" fn hooked_ConnectEx(
     record_synthetic_connectex(socket, overlapped, payload_bytes_sent);
 
     if notify_synthetic_connectex_completion(socket, overlapped, payload_bytes_sent) {
+        trace::log(format!(
+            "hooked_ConnectEx completion queued socket={socket:#x} bytes_sent={payload_bytes_sent}"
+        ));
         unsafe {
             WSASetLastError(WSA_IO_PENDING as i32);
         }
@@ -819,6 +898,9 @@ pub unsafe extern "system" fn hooked_ConnectEx(
     unsafe {
         WSASetLastError(0);
     }
+    trace::log(format!(
+        "hooked_ConnectEx synchronous success socket={socket:#x} bytes_sent={payload_bytes_sent}"
+    ));
     1
 }
 

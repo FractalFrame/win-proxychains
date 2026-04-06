@@ -1,5 +1,4 @@
 use std::{
-    cell::RefCell,
     collections::HashSet,
     ffi::CStr,
     mem::{align_of, size_of},
@@ -19,10 +18,11 @@ use windows_sys::Win32::{
         SOCKADDR_IN6_0, WSAAsyncGetHostByName, WSAEINVAL, WSAENOBUFS, WSANO_DATA, WSASetLastError,
         freeaddrinfo, getaddrinfo, gethostbyname,
     },
+    System::Threading::GetCurrentThreadId,
     UI::WindowsAndMessaging::PostMessageW,
 };
 
-use crate::{get_context, set_last_error};
+use crate::{get_context, set_last_error, trace};
 
 const DEFAULT_REMOTE_DNS_SUBNET_V4: u8 = 224;
 const DEFAULT_REMOTE_DNS_SUBNET_V6: u8 = 252;
@@ -57,6 +57,10 @@ fn cached_trampoline(cache: &AtomicU64, target: u64, function_name: &str) -> Opt
     trampoline = hook.trampoline();
     cache.store(trampoline, Ordering::SeqCst);
     Some(trampoline)
+}
+
+pub(crate) fn seed_free_addr_info_w_trampoline(trampoline: u64) {
+    FPTR_O_FREE_ADDR_INFOW.store(trampoline, Ordering::SeqCst);
 }
 
 fn proxy_dns_enabled() -> Option<(u8, u8)> {
@@ -232,7 +236,7 @@ struct ServiceInfo {
 }
 
 #[derive(Default)]
-struct FakeHostentStorage {
+pub struct FakeHostentStorage {
     hostent: HOSTENT,
     aliases: [*mut i8; 1],
     addr_list: [*mut i8; 2],
@@ -260,8 +264,17 @@ impl FakeHostentStorage {
     }
 }
 
-thread_local! {
-    static HOSTENT_STORAGE: RefCell<FakeHostentStorage> = RefCell::new(FakeHostentStorage::default());
+fn populate_thread_hostent_storage(name: &str, address: Ipv4Addr) -> *mut HOSTENT {
+    let context = get_context();
+    let thread_id = unsafe { GetCurrentThreadId() };
+    let mut hostent_storage = context
+        .dns_hostent_storage
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let storage = hostent_storage
+        .entry(thread_id)
+        .or_insert_with(|| Box::new(FakeHostentStorage::default()));
+    storage.populate(name, address)
 }
 
 #[repr(C)]
@@ -735,6 +748,32 @@ unsafe fn free_owned_addrinfo_w(root: *const ADDRINFOW) {
     }
 }
 
+unsafe fn try_free_owned_addrinfo_alias(root: usize) -> bool {
+    let was_owned_a = OWNED_ADDRINFO_A_ROOTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&root);
+    if was_owned_a {
+        unsafe {
+            free_owned_addrinfo_a(root as *const ADDRINFOA);
+        }
+        return true;
+    }
+
+    let was_owned_w = OWNED_ADDRINFOW_ROOTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&root);
+    if was_owned_w {
+        unsafe {
+            free_owned_addrinfo_w(root as *const ADDRINFOW);
+        }
+        return true;
+    }
+
+    false
+}
+
 fn align_up(value: usize, align: usize) -> usize {
     (value + (align - 1)) & !(align - 1)
 }
@@ -963,8 +1002,12 @@ pub unsafe extern "system" fn hooked_gethostbyname(name: *const i8) -> *mut HOST
     let Some(name_string) = (unsafe { pcstr_to_string(name) }) else {
         return unsafe { o_gethostbyname(name) };
     };
+    trace::log(format!("hooked_gethostbyname name={name_string}"));
 
     let Some(addresses) = cached_or_allocate_fake_dns_entries(&name_string) else {
+        trace::log(format!(
+            "hooked_gethostbyname passthrough name={name_string}"
+        ));
         return unsafe { o_gethostbyname(name) };
     };
 
@@ -975,13 +1018,16 @@ pub unsafe extern "system" fn hooked_gethostbyname(name: *const i8) -> *mut HOST
         unsafe {
             WSASetLastError(WSANO_DATA as i32);
         }
+        trace::log(format!(
+            "hooked_gethostbyname no_ipv4_mapping name={name_string}"
+        ));
         return null_mut();
     };
+    trace::log(format!(
+        "hooked_gethostbyname fabricated name={name_string} ipv4={ipv4}"
+    ));
 
-    HOSTENT_STORAGE.with(|storage| {
-        let mut storage = storage.borrow_mut();
-        storage.populate(&name_string, ipv4)
-    })
+    populate_thread_hostent_storage(&name_string, ipv4)
 }
 
 #[unsafe(no_mangle)]
@@ -995,8 +1041,15 @@ pub unsafe extern "system" fn hooked_WSAAsyncGetHostByName(
     let Some(name_string) = (unsafe { pcstr_to_string(name) }) else {
         return unsafe { o_WSAAsyncGetHostByName(hwnd, message, name, buffer, buffer_len) };
     };
+    trace::log(format!(
+        "hooked_WSAAsyncGetHostByName name={} buffer={buffer:p} buffer_len={}",
+        name_string, buffer_len
+    ));
 
     let Some(addresses) = cached_or_allocate_fake_dns_entries(&name_string) else {
+        trace::log(format!(
+            "hooked_WSAAsyncGetHostByName passthrough name={name_string}"
+        ));
         return unsafe { o_WSAAsyncGetHostByName(hwnd, message, name, buffer, buffer_len) };
     };
 
@@ -1012,6 +1065,9 @@ pub unsafe extern "system" fn hooked_WSAAsyncGetHostByName(
         IpAddr::V4(ipv4) => Some(ipv4),
         IpAddr::V6(_) => None,
     }) else {
+        trace::log(format!(
+            "hooked_WSAAsyncGetHostByName no_ipv4_mapping name={name_string}"
+        ));
         if !unsafe { post_async_dns_completion(hwnd, message, task_handle, WSANO_DATA as i32, 0) } {
             unsafe {
                 WSASetLastError(WSAEINVAL as i32);
@@ -1027,6 +1083,10 @@ pub unsafe extern "system" fn hooked_WSAAsyncGetHostByName(
     match unsafe { write_async_hostent(buffer as *mut u8, buffer_len as usize, &name_string, ipv4) }
     {
         Ok(()) => {
+            trace::log(format!(
+                "hooked_WSAAsyncGetHostByName fabricated name={} ipv4={} task_handle={:#x}",
+                name_string, ipv4, task_handle as usize
+            ));
             if !unsafe { post_async_dns_completion(hwnd, message, task_handle, 0, 0) } {
                 unsafe {
                     WSASetLastError(WSAEINVAL as i32);
@@ -1068,6 +1128,7 @@ pub unsafe extern "system" fn hooked_getaddrinfo(
     let Some(name_string) = (unsafe { pcstr_to_string(node_name) }) else {
         return unsafe { o_getaddrinfo(node_name, service_name, hints, result) };
     };
+    trace::log(format!("hooked_getaddrinfo node={name_string}"));
 
     let requested_family = if hints.is_null() {
         AF_UNSPEC as i32
@@ -1078,15 +1139,24 @@ pub unsafe extern "system" fn hooked_getaddrinfo(
         requested_family,
         family if family == AF_UNSPEC as i32 || family == AF_INET as i32 || family == AF_INET6 as i32
     ) {
+        trace::log(format!(
+            "hooked_getaddrinfo passthrough node={} family={requested_family}",
+            name_string
+        ));
         return unsafe { o_getaddrinfo(node_name, service_name, hints, result) };
     }
 
     let Some(addresses) = cached_or_allocate_fake_dns_entries(&name_string) else {
+        trace::log(format!("hooked_getaddrinfo passthrough node={name_string}"));
         return unsafe { o_getaddrinfo(node_name, service_name, hints, result) };
     };
 
     let filtered = filter_fake_dns_addresses(addresses, requested_family);
     if filtered.is_empty() {
+        trace::log(format!(
+            "hooked_getaddrinfo no_filtered_addresses node={} family={requested_family}",
+            name_string
+        ));
         if !result.is_null() {
             unsafe {
                 *result = null_mut();
@@ -1107,6 +1177,12 @@ pub unsafe extern "system" fn hooked_getaddrinfo(
         }
     };
 
+    trace::log(format!(
+        "hooked_getaddrinfo fabricated node={} family={} result_ptr={result:p} count={}",
+        name_string,
+        requested_family,
+        filtered.len()
+    ));
     unsafe { build_owned_addrinfo_a(filtered, &name_string, service, result) }
 }
 
@@ -1120,6 +1196,7 @@ pub unsafe extern "system" fn hooked_GetAddrInfoW(
     let Some(name_string) = (unsafe { pcwstr_to_string(node_name) }) else {
         return unsafe { o_GetAddrInfoW(node_name, service_name, hints, result) };
     };
+    trace::log(format!("hooked_GetAddrInfoW node={name_string}"));
 
     let requested_family = if hints.is_null() {
         AF_UNSPEC as i32
@@ -1130,15 +1207,26 @@ pub unsafe extern "system" fn hooked_GetAddrInfoW(
         requested_family,
         family if family == AF_UNSPEC as i32 || family == AF_INET as i32 || family == AF_INET6 as i32
     ) {
+        trace::log(format!(
+            "hooked_GetAddrInfoW passthrough node={} family={requested_family}",
+            name_string
+        ));
         return unsafe { o_GetAddrInfoW(node_name, service_name, hints, result) };
     }
 
     let Some(addresses) = cached_or_allocate_fake_dns_entries(&name_string) else {
+        trace::log(format!(
+            "hooked_GetAddrInfoW passthrough node={name_string}"
+        ));
         return unsafe { o_GetAddrInfoW(node_name, service_name, hints, result) };
     };
 
     let filtered = filter_fake_dns_addresses(addresses, requested_family);
     if filtered.is_empty() {
+        trace::log(format!(
+            "hooked_GetAddrInfoW no_filtered_addresses node={} family={requested_family}",
+            name_string
+        ));
         if !result.is_null() {
             unsafe {
                 *result = null_mut();
@@ -1159,6 +1247,12 @@ pub unsafe extern "system" fn hooked_GetAddrInfoW(
         }
     };
 
+    trace::log(format!(
+        "hooked_GetAddrInfoW fabricated node={} family={} result_ptr={result:p} count={}",
+        name_string,
+        requested_family,
+        filtered.len()
+    ));
     unsafe { build_owned_addrinfo_w(filtered, &name_string, service, result) }
 }
 
@@ -1169,14 +1263,11 @@ pub unsafe extern "system" fn hooked_freeaddrinfo(result: *const ADDRINFOA) {
     }
 
     let root = result as usize;
-    let was_owned = OWNED_ADDRINFO_A_ROOTS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .remove(&root);
+    let was_owned = unsafe { try_free_owned_addrinfo_alias(root) };
+    trace::log(format!(
+        "hooked_freeaddrinfo result={result:p} owned={was_owned}"
+    ));
     if was_owned {
-        unsafe {
-            free_owned_addrinfo_a(result);
-        }
         return;
     }
 
@@ -1192,14 +1283,11 @@ pub unsafe extern "system" fn hooked_FreeAddrInfoW(result: *const ADDRINFOW) {
     }
 
     let root = result as usize;
-    let was_owned = OWNED_ADDRINFOW_ROOTS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .remove(&root);
+    let was_owned = unsafe { try_free_owned_addrinfo_alias(root) };
+    trace::log(format!(
+        "hooked_FreeAddrInfoW result={result:p} owned={was_owned}"
+    ));
     if was_owned {
-        unsafe {
-            free_owned_addrinfo_w(result);
-        }
         return;
     }
 
