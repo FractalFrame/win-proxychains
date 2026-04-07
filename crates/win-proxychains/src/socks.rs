@@ -1,9 +1,15 @@
-use std::{
-    mem::size_of,
+use alloc::{
+    format,
+    string::ToString,
+    vec,
+    vec::Vec,
+};
+use core::{
+    fmt,
+    iter,
+    mem::{self, size_of},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     ptr::null_mut,
-    thread,
-    time::{Duration, Instant},
 };
 
 use anyhow::Result;
@@ -11,21 +17,25 @@ use windows_sys::Win32::Networking::WinSock::{
     ADDRINFOW, AF_INET, AF_INET6, AF_UNSPEC, IN_ADDR, IN_ADDR_0, IN_ADDR_0_0, IN6_ADDR, IN6_ADDR_0,
     IPPROTO_TCP, SO_RCVTIMEO, SO_SNDTIMEO, SOCK_STREAM, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6,
     SOCKADDR_IN6_0, SOCKET, SOL_SOCKET, WSAEALREADY, WSAEINPROGRESS, WSAEISCONN, WSAEWOULDBLOCK,
-    WSAGetLastError, recv, send, setsockopt,
+    WSAGetLastError,
+};
+use windows_sys::Win32::System::{
+    SystemInformation::GetTickCount64,
+    Threading::Sleep,
 };
 
 use crate::{
-    bail_with_last_error,
+    Context,
     config::{ProxyEntry, ProxyType},
     hooks_dns::{o_FreeAddrInfoW, o_GetAddrInfoW, reverse_fake_dns_name},
-    hooks_sockets::o_connect,
-    trace,
+    hooks_sockets::{o_connect, o_recv, o_send, o_setsockopt},
+    set_last_error_in_context, trace,
 };
 
-const WINSOCK_SPIN_WAIT: Duration = Duration::from_millis(0);
+const WINSOCK_SPIN_WAIT_MS: u32 = 0;
 const DEFAULT_TCP_CONNECT_TIMEOUT_MS: u64 = 20_000;
 
-type SpinTimeout = Option<(u64, Instant)>;
+type SpinTimeout = Option<(u64, u64)>;
 
 fn spin_on_would_block(error_code: i32) -> bool {
     matches!(
@@ -37,35 +47,47 @@ fn spin_on_would_block(error_code: i32) -> bool {
 }
 
 fn spin_wait() {
-    thread::sleep(WINSOCK_SPIN_WAIT);
+    unsafe {
+        Sleep(WINSOCK_SPIN_WAIT_MS);
+    }
+}
+
+fn now_ms() -> u64 {
+    unsafe { GetTickCount64() }
 }
 
 fn new_spin_timeout(timeout_ms: Option<u64>) -> SpinTimeout {
-    timeout_ms.map(|timeout_ms| {
-        (
-            timeout_ms,
-            Instant::now() + Duration::from_millis(timeout_ms),
-        )
-    })
+    timeout_ms.map(|timeout_ms| (timeout_ms, now_ms().saturating_add(timeout_ms)))
 }
 
-fn bail_with_socket_error<T>(message: impl std::fmt::Display) -> Result<T> {
+fn bail_with_socket_error_in_context<T>(
+    context: &mut Context,
+    message: impl fmt::Display,
+) -> Result<T> {
     let error_code = unsafe { WSAGetLastError() };
     let full_message = format!("{message}: WSA error {error_code}");
-    crate::set_last_error(full_message.clone());
+    set_last_error_in_context(context, full_message.clone());
     Err(anyhow::anyhow!(full_message))
 }
 
-fn timeout_error<T>(timeout_ms: u64, message: impl std::fmt::Display) -> Result<T> {
+fn timeout_error_in_context<T>(
+    context: &mut Context,
+    timeout_ms: u64,
+    message: impl fmt::Display,
+) -> Result<T> {
     let full_message = format!("Timed out after {timeout_ms}ms while {message}");
-    crate::set_last_error(full_message.clone());
+    set_last_error_in_context(context, full_message.clone());
     Err(anyhow::anyhow!(full_message))
 }
 
-fn spin_wait_with_timeout(timeout: SpinTimeout, message: impl std::fmt::Display) -> Result<()> {
+fn spin_wait_with_timeout_in_context(
+    context: &mut Context,
+    timeout: SpinTimeout,
+    message: impl fmt::Display,
+) -> Result<()> {
     if let Some((timeout_ms, deadline)) = timeout {
-        if Instant::now() >= deadline {
-            return timeout_error(timeout_ms, message);
+        if now_ms() >= deadline {
+            return timeout_error_in_context(context, timeout_ms, message);
         }
     }
 
@@ -74,6 +96,7 @@ fn spin_wait_with_timeout(timeout: SpinTimeout, message: impl std::fmt::Display)
 }
 
 fn receive_exact(
+    context: &mut Context,
     socket: SOCKET,
     buffer: &mut [u8],
     timeout: SpinTimeout,
@@ -83,7 +106,8 @@ fn receive_exact(
 
     while received < buffer.len() {
         let recv_resp = unsafe {
-            recv(
+            o_recv(
+                context,
                 socket as usize,
                 buffer[received..].as_mut_ptr(),
                 (buffer.len() - received) as i32,
@@ -94,10 +118,10 @@ fn receive_exact(
         if recv_resp == -1 {
             let error_code = unsafe { WSAGetLastError() };
             if error_code == WSAEWOULDBLOCK as i32 {
-                spin_wait_with_timeout(timeout, timeout_context)?;
+                spin_wait_with_timeout_in_context(context, timeout, timeout_context)?;
                 continue;
             }
-            return bail_with_socket_error("Failed to receive exact bytes");
+            return bail_with_socket_error_in_context(context, "Failed to receive exact bytes");
         }
 
         if recv_resp == 0 {
@@ -114,6 +138,7 @@ fn receive_exact(
 }
 
 fn send_exact(
+    context: &mut Context,
     socket: SOCKET,
     buffer: &[u8],
     timeout: SpinTimeout,
@@ -123,7 +148,8 @@ fn send_exact(
 
     while sent < buffer.len() {
         let send_resp = unsafe {
-            send(
+            o_send(
+                context,
                 socket as usize,
                 buffer[sent..].as_ptr(),
                 (buffer.len() - sent) as i32,
@@ -134,10 +160,10 @@ fn send_exact(
         if send_resp == -1 {
             let error_code = unsafe { WSAGetLastError() };
             if error_code == WSAEWOULDBLOCK as i32 {
-                spin_wait_with_timeout(timeout, timeout_context)?;
+                spin_wait_with_timeout_in_context(context, timeout, timeout_context)?;
                 continue;
             }
-            return bail_with_socket_error("Failed to send exact bytes");
+            return bail_with_socket_error_in_context(context, "Failed to send exact bytes");
         }
 
         if send_resp == 0 {
@@ -154,13 +180,14 @@ fn send_exact(
 }
 
 pub fn wrap_socket_in_single_socks4a(
+    context: &mut Context,
     next_name: &str,
     next_port: u16,
     socket: SOCKET,
     proxy: &ProxyEntry,
     read_timeout_ms: Option<u64>,
 ) -> Result<()> {
-    let needs_4a = next_name.parse::<std::net::Ipv4Addr>().is_err();
+    let needs_4a = next_name.parse::<Ipv4Addr>().is_err();
     let wrap_timeout = new_spin_timeout(read_timeout_ms);
     let timeout_context = format!(
         "wrapping socket in SOCKS4a proxy {}:{} for {next_name}:{next_port}",
@@ -177,7 +204,7 @@ pub fn wrap_socket_in_single_socks4a(
         reqest_format.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]); // Fake IP for 4a
     } else {
         // If the next_name is an IP address, we can use the normal format
-        let ip = next_name.parse::<std::net::Ipv4Addr>()?;
+        let ip = next_name.parse::<Ipv4Addr>()?;
         reqest_format.extend_from_slice(&ip.octets()); // IP address in octets
     }
 
@@ -195,11 +222,23 @@ pub fn wrap_socket_in_single_socks4a(
         reqest_format.push(0); // Null terminator for the domain name
     }
 
-    send_exact(socket, &reqest_format, wrap_timeout, &timeout_context)?;
+    send_exact(
+        context,
+        socket,
+        &reqest_format,
+        wrap_timeout,
+        &timeout_context,
+    )?;
 
     // Wait for a response
     let mut response_buffer: [u8; 8] = [0; 8];
-    receive_exact(socket, &mut response_buffer, wrap_timeout, &timeout_context)?;
+    receive_exact(
+        context,
+        socket,
+        &mut response_buffer,
+        wrap_timeout,
+        &timeout_context,
+    )?;
 
     // Validate the response
     if response_buffer[0] != 0x00 {
@@ -221,6 +260,7 @@ pub fn wrap_socket_in_single_socks4a(
 }
 
 pub fn wrap_socket_in_single_socks5(
+    context: &mut Context,
     next_name: &str,
     next_port: u16,
     socket: SOCKET,
@@ -242,10 +282,17 @@ pub fn wrap_socket_in_single_socks5(
         }, // Authentication method: either "no authentication" or "username/password"
     ];
 
-    send_exact(socket, &negotiate_packet, wrap_timeout, &timeout_context)?;
+    send_exact(
+        context,
+        socket,
+        &negotiate_packet,
+        wrap_timeout,
+        &timeout_context,
+    )?;
 
     let mut negotiate_response = [0u8; 2];
     receive_exact(
+        context,
         socket,
         &mut negotiate_response,
         wrap_timeout,
@@ -272,10 +319,22 @@ pub fn wrap_socket_in_single_socks5(
                 auth_packet.push(creds.password.len() as u8); // Password length
                 auth_packet.extend_from_slice(creds.password.as_bytes()); // Password
 
-                send_exact(socket, &auth_packet, wrap_timeout, &timeout_context)?;
+                send_exact(
+                    context,
+                    socket,
+                    &auth_packet,
+                    wrap_timeout,
+                    &timeout_context,
+                )?;
 
                 let mut auth_response = [0u8; 2];
-                receive_exact(socket, &mut auth_response, wrap_timeout, &timeout_context)?;
+                receive_exact(
+                    context,
+                    socket,
+                    &mut auth_response,
+                    wrap_timeout,
+                    &timeout_context,
+                )?;
 
                 if auth_response[0] != 0x01 {
                     return Err(anyhow::anyhow!(
@@ -312,10 +371,10 @@ pub fn wrap_socket_in_single_socks5(
     request_packet.push(0x05); // SOCKS5 version
     request_packet.push(0x01); // Command: CONNECT
     request_packet.push(0x00); // Reserved
-    if let Ok(ip) = next_name.parse::<std::net::Ipv4Addr>() {
+    if let Ok(ip) = next_name.parse::<Ipv4Addr>() {
         request_packet.push(0x01); // Address type: IPv4
         request_packet.extend_from_slice(&ip.octets()); // IPv4 address in octets
-    } else if let Ok(ip) = next_name.parse::<std::net::Ipv6Addr>() {
+    } else if let Ok(ip) = next_name.parse::<Ipv6Addr>() {
         request_packet.push(0x04); // Address type: IPv6
         request_packet.extend_from_slice(&ip.octets()); // IPv6 address in octets
     } else {
@@ -326,12 +385,24 @@ pub fn wrap_socket_in_single_socks5(
 
     request_packet.extend_from_slice(&next_port.to_be_bytes()); // Port in big-endian
 
-    send_exact(socket, &request_packet, wrap_timeout, &timeout_context)?;
+    send_exact(
+        context,
+        socket,
+        &request_packet,
+        wrap_timeout,
+        &timeout_context,
+    )?;
 
     // we must now carefully parse the reply, which has a variable length header depending on the address type
     // first grab the first two bytes
     let mut response_header = [0u8; 2];
-    receive_exact(socket, &mut response_header, wrap_timeout, &timeout_context)?;
+    receive_exact(
+        context,
+        socket,
+        &mut response_header,
+        wrap_timeout,
+        &timeout_context,
+    )?;
 
     if response_header[0] != 0x05 {
         return Err(anyhow::anyhow!(
@@ -351,6 +422,7 @@ pub fn wrap_socket_in_single_socks5(
     // 1 byte reserved, 1 byte address type
     let mut response_addr_header = [0u8; 2];
     receive_exact(
+        context,
         socket,
         &mut response_addr_header,
         wrap_timeout,
@@ -364,12 +436,19 @@ pub fn wrap_socket_in_single_socks5(
         0x01 => {
             // IPv4 address, read 4 bytes for the address and 2 bytes for the port
             let mut ipv4_response = [0u8; 6];
-            receive_exact(socket, &mut ipv4_response, wrap_timeout, &timeout_context)?;
+            receive_exact(
+                context,
+                socket,
+                &mut ipv4_response,
+                wrap_timeout,
+                &timeout_context,
+            )?;
         }
         0x03 => {
             // Domain name, read 1 byte for the domain length, then read the domain and 2 bytes for the port
             let mut domain_length_buf = [0u8; 1];
             receive_exact(
+                context,
                 socket,
                 &mut domain_length_buf,
                 wrap_timeout,
@@ -378,12 +457,24 @@ pub fn wrap_socket_in_single_socks5(
             let domain_length = domain_length_buf[0] as usize;
 
             let mut domain_response = vec![0u8; domain_length + 2];
-            receive_exact(socket, &mut domain_response, wrap_timeout, &timeout_context)?;
+            receive_exact(
+                context,
+                socket,
+                &mut domain_response,
+                wrap_timeout,
+                &timeout_context,
+            )?;
         }
         0x04 => {
             // IPv6 address, read 16 bytes for the address and 2 bytes for the port
             let mut ipv6_response = [0u8; 18];
-            receive_exact(socket, &mut ipv6_response, wrap_timeout, &timeout_context)?;
+            receive_exact(
+                context,
+                socket,
+                &mut ipv6_response,
+                wrap_timeout,
+                &timeout_context,
+            )?;
         }
         _ => {
             return Err(anyhow::anyhow!(
@@ -398,6 +489,7 @@ pub fn wrap_socket_in_single_socks5(
 }
 
 pub fn wrap_socket_in_single_proxy(
+    context: &mut Context,
     next_name: &str,
     next_port: u16,
     socket: SOCKET,
@@ -405,29 +497,27 @@ pub fn wrap_socket_in_single_proxy(
     read_timeout_ms: Option<u64>,
 ) -> Result<()> {
     match proxy.proxy_type {
-        ProxyType::Socks4 => {
-            wrap_socket_in_single_socks4a(next_name, next_port, socket, proxy, read_timeout_ms)
-        }
-        ProxyType::Socks5 => {
-            wrap_socket_in_single_socks5(next_name, next_port, socket, proxy, read_timeout_ms)
-        }
+        ProxyType::Socks4 => wrap_socket_in_single_socks4a(
+            context,
+            next_name,
+            next_port,
+            socket,
+            proxy,
+            read_timeout_ms,
+        ),
+        ProxyType::Socks5 => wrap_socket_in_single_socks5(
+            context,
+            next_name,
+            next_port,
+            socket,
+            proxy,
+            read_timeout_ms,
+        ),
     }
 }
 
 fn wide_null(value: &str) -> Vec<u16> {
-    value.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-struct AddrInfoList {
-    raw: *mut ADDRINFOW,
-}
-
-impl Drop for AddrInfoList {
-    fn drop(&mut self) {
-        if !self.raw.is_null() {
-            unsafe { o_FreeAddrInfoW(self.raw) };
-        }
-    }
+    value.encode_utf16().chain(iter::once(0)).collect()
 }
 
 fn socket_addr_from_raw(addr: *const SOCKADDR, addr_len: usize) -> Result<Option<SocketAddr>> {
@@ -476,7 +566,7 @@ fn socket_addr_from_raw(addr: *const SOCKADDR, addr_len: usize) -> Result<Option
     }
 }
 
-fn resolve_targets(name: &str, port: u16) -> Result<Vec<SocketAddr>> {
+fn resolve_targets(context: &mut Context, name: &str, port: u16) -> Result<Vec<SocketAddr>> {
     if let Ok(ip) = name.parse::<IpAddr>() {
         return Ok(vec![SocketAddr::new(ip, port)]);
     }
@@ -493,6 +583,7 @@ fn resolve_targets(name: &str, port: u16) -> Result<Vec<SocketAddr>> {
 
     let status = unsafe {
         o_GetAddrInfoW(
+            context,
             host_wide.as_ptr(),
             service_wide.as_ptr(),
             &hints,
@@ -504,16 +595,18 @@ fn resolve_targets(name: &str, port: u16) -> Result<Vec<SocketAddr>> {
             "GetAddrInfoW({name}, {port}) failed with code {status}"
         ));
     }
-
-    let result = AddrInfoList { raw: result };
     let mut targets = Vec::new();
-    let mut cursor = result.raw;
+    let mut cursor = result;
     while !cursor.is_null() {
         let addr = unsafe { &*cursor };
         if let Some(target) = socket_addr_from_raw(addr.ai_addr, addr.ai_addrlen)? {
             targets.push(target);
         }
         cursor = addr.ai_next;
+    }
+
+    unsafe {
+        o_FreeAddrInfoW(context, result);
     }
 
     if targets.is_empty() {
@@ -526,6 +619,7 @@ fn resolve_targets(name: &str, port: u16) -> Result<Vec<SocketAddr>> {
 }
 
 pub fn connect_socket(
+    context: &mut Context,
     socket: SOCKET,
     name: &str,
     port: u16,
@@ -533,7 +627,7 @@ pub fn connect_socket(
 ) -> Result<()> {
     // A note about proxy_dns, we _do_ leak the addresses of the proxy here
     // proxy_dns does not prevent DNS lookups for your proxies, it only prevents lookups for the final destination.
-    let targets = resolve_targets(name, port)?;
+    let targets = resolve_targets(context, name, port)?;
     let connect_timeout = new_spin_timeout(Some(connect_timeout_ms));
     let timeout_context = format!("connecting socket to {name}:{port}");
 
@@ -560,9 +654,10 @@ pub fn connect_socket(
                 loop {
                     let connect_result = unsafe {
                         o_connect(
+                            context,
                             socket,
                             &sockaddr as *const SOCKADDR_IN as *const SOCKADDR,
-                            std::mem::size_of::<SOCKADDR_IN>() as i32,
+                            mem::size_of::<SOCKADDR_IN>() as i32,
                         )
                     };
 
@@ -575,7 +670,11 @@ pub fn connect_socket(
                         return Ok(());
                     }
                     if spin_on_would_block(error_code) {
-                        spin_wait_with_timeout(connect_timeout, &timeout_context)?;
+                        spin_wait_with_timeout_in_context(
+                            context,
+                            connect_timeout,
+                            &timeout_context,
+                        )?;
                         continue;
                     }
                     break;
@@ -599,9 +698,10 @@ pub fn connect_socket(
                 loop {
                     let connect_result = unsafe {
                         o_connect(
+                            context,
                             socket,
                             &sockaddr as *const SOCKADDR_IN6 as *const SOCKADDR,
-                            std::mem::size_of::<SOCKADDR_IN6>() as i32,
+                            mem::size_of::<SOCKADDR_IN6>() as i32,
                         )
                     };
 
@@ -614,7 +714,11 @@ pub fn connect_socket(
                         return Ok(());
                     }
                     if spin_on_would_block(error_code) {
-                        spin_wait_with_timeout(connect_timeout, &timeout_context)?;
+                        spin_wait_with_timeout_in_context(
+                            context,
+                            connect_timeout,
+                            &timeout_context,
+                        )?;
                         continue;
                     }
                     break;
@@ -623,7 +727,10 @@ pub fn connect_socket(
         }
     }
 
-    bail_with_socket_error(format!("Failed to connect socket to {name}:{port}"))
+    bail_with_socket_error_in_context(
+        context,
+        format!("Failed to connect socket to {name}:{port}"),
+    )
 }
 
 fn socket_timeout_value(timeout_ms: u64, option_name: &str) -> Result<u32> {
@@ -635,6 +742,7 @@ fn socket_timeout_value(timeout_ms: u64, option_name: &str) -> Result<u32> {
 }
 
 fn set_socket_timeout(
+    context: &mut Context,
     socket: SOCKET,
     option_name: i32,
     timeout_ms: u64,
@@ -648,7 +756,8 @@ fn set_socket_timeout(
 
     let timeout_ptr = &timeout_ms as *const u32 as *const u8;
     let result = unsafe {
-        setsockopt(
+        o_setsockopt(
+            context,
             socket,
             SOL_SOCKET,
             option_name,
@@ -657,13 +766,14 @@ fn set_socket_timeout(
         )
     };
     if result == -1 {
-        return bail_with_last_error(format!("Failed to set {label}"));
+        return bail_with_socket_error_in_context(context, format!("Failed to set {label}"));
     }
 
     Ok(())
 }
 
 pub fn wrap_socket_in_requested_chain(
+    context: &mut Context,
     top_level_name: &str,
     top_level_port: u16,
     socket: SOCKET,
@@ -675,21 +785,34 @@ pub fn wrap_socket_in_requested_chain(
     let connect_timeout_ms = tcp_connect_timeout_ms.unwrap_or(DEFAULT_TCP_CONNECT_TIMEOUT_MS);
 
     if let Some(recv_timeout_ms) = tcp_read_timeout_ms {
-        set_socket_timeout(socket, SO_RCVTIMEO, recv_timeout_ms, "SO_RCVTIMEO")?;
+        set_socket_timeout(context, socket, SO_RCVTIMEO, recv_timeout_ms, "SO_RCVTIMEO")?;
     }
 
     if let Some(connect_timeout_ms) = tcp_connect_timeout_ms {
-        set_socket_timeout(socket, SO_SNDTIMEO, connect_timeout_ms, "SO_SNDTIMEO")?;
+        set_socket_timeout(
+            context,
+            socket,
+            SO_SNDTIMEO,
+            connect_timeout_ms,
+            "SO_SNDTIMEO",
+        )?;
     }
 
     if chain.is_empty() {
-        return connect_socket(socket, top_level_name, top_level_port, connect_timeout_ms);
+        return connect_socket(
+            context,
+            socket,
+            top_level_name,
+            top_level_port,
+            connect_timeout_ms,
+        );
     }
 
     // Iterate through the chain in dynamic mode until we find a proxy that works
     let mut start_index = 0;
     loop {
         if let Err(error) = connect_socket(
+            context,
             socket,
             &chain[start_index].host,
             chain[start_index].port,
@@ -725,7 +848,7 @@ pub fn wrap_socket_in_requested_chain(
         // even if we're in a dynamic chain and some proxies earlier in the chain failed to connect
         if i == chain.len() - 1 {
             // The next entry is the final destination
-            final_request_name = reverse_fake_dns_name(top_level_name);
+            final_request_name = reverse_fake_dns_name(context, top_level_name);
             next_name = final_request_name.as_deref().unwrap_or(top_level_name);
             next_port = top_level_port;
 
@@ -743,8 +866,14 @@ pub fn wrap_socket_in_requested_chain(
             next_port = chain[i + 1].port;
         }
 
-        let result =
-            wrap_socket_in_single_proxy(next_name, next_port, socket, proxy, tcp_read_timeout_ms);
+        let result = wrap_socket_in_single_proxy(
+            context,
+            next_name,
+            next_port,
+            socket,
+            proxy,
+            tcp_read_timeout_ms,
+        );
 
         // Check if there was an error
         // If we're in a dynamic chain and this isn't the last proxy,
@@ -777,10 +906,12 @@ pub fn wrap_socket_in_requested_chain(
 #[cfg(test)]
 mod tests {
     use std::{
+        format,
         io::ErrorKind,
         mem::MaybeUninit,
         net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs},
         os::windows::io::AsRawSocket,
+        string::{String, ToString},
         sync::{
             Mutex, Once,
             atomic::{AtomicUsize, Ordering},
@@ -798,6 +929,7 @@ mod tests {
     use super::{connect_socket, wrap_socket_in_single_socks5};
     use crate::config::{ProxyEntry, ProxyType};
     use crate::hooks_sockets::{reset_o_connect_for_tests, set_o_connect_for_tests};
+    use crate::lock_context;
 
     static WINSOCK_INIT: Once = Once::new();
     static TEST_MUTEX: Mutex<()> = Mutex::new(());
@@ -868,7 +1000,8 @@ mod tests {
         let raw_socket = unsafe { socket(family, SOCK_STREAM, IPPROTO_TCP) };
         assert_ne!(raw_socket, INVALID_SOCKET, "socket creation should succeed");
 
-        let connect_result = connect_socket(raw_socket, name, port, 5000);
+        let mut context = lock_context();
+        let connect_result = connect_socket(&mut context, raw_socket, name, port, 5000);
 
         let close_result = unsafe { closesocket(raw_socket) };
         assert_eq!(close_result, 0, "closesocket should succeed");
@@ -945,7 +1078,8 @@ mod tests {
 
         CONNECT_CALLS.store(0, Ordering::SeqCst);
         let started = Instant::now();
-        let error = connect_socket(raw_socket, "127.0.0.1", 8080, 20).expect_err(
+        let mut context = lock_context();
+        let error = connect_socket(&mut context, raw_socket, "127.0.0.1", 8080, 20).expect_err(
             "connect_socket should time out when connect keeps returning WSAEWOULDBLOCK",
         );
 
@@ -1004,7 +1138,9 @@ mod tests {
             credentials: None,
         };
 
+        let mut context = lock_context();
         let error = wrap_socket_in_single_socks5(
+            &mut context,
             "example.com",
             443,
             stream.as_raw_socket() as SOCKET,

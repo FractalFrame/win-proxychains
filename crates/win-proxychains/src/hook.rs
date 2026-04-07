@@ -1,3 +1,10 @@
+use alloc::{
+    ffi::CString,
+    format,
+    string::{String, ToString},
+    vec::Vec,
+};
+use core::ptr;
 use iced_x86::{BlockEncoderOptions, Decoder, DecoderOptions, Instruction};
 use windows_sys::Win32::System::{
     Diagnostics::Debug::FlushInstructionCache,
@@ -44,7 +51,7 @@ pub struct HookContext {
 
 impl HookContext {
     pub fn new(module: &str, function: &str, target: u64) -> Result<Self> {
-        let c_string_module_name = std::ffi::CString::new(module)?;
+        let c_string_module_name = CString::new(module)?;
 
         let mut h_module = unsafe { GetModuleHandleA(c_string_module_name.as_ptr() as *const _) };
 
@@ -60,7 +67,7 @@ impl HookContext {
         let h_proc = unsafe {
             GetProcAddress(
                 h_module,
-                std::ffi::CString::new(function)?.as_ptr() as *const _,
+                CString::new(function)?.as_ptr() as *const _,
             )
         };
 
@@ -113,7 +120,7 @@ impl HookContext {
     fn fetch_instruction_bytes_at(address: u64) -> [u8; 16] {
         let mut bytes = [0u8; 16];
         unsafe {
-            std::ptr::copy_nonoverlapping(address as *const u8, bytes.as_mut_ptr(), bytes.len());
+            ptr::copy_nonoverlapping(address as *const u8, bytes.as_mut_ptr(), bytes.len());
         }
         bytes
     }
@@ -265,7 +272,7 @@ impl HookContext {
 
         // copy the tranplanted instructions to the trampoline memory
         unsafe {
-            std::ptr::copy_nonoverlapping(
+            ptr::copy_nonoverlapping(
                 encoded_block.code_buffer.as_ptr(),
                 self.trampoline as *mut u8,
                 encoded_size,
@@ -325,7 +332,7 @@ impl HookContext {
             let mut patch_bytes = [0u8; 5];
             patch_bytes[0] = 0xe9; // JMP opcode
             patch_bytes[1..].copy_from_slice(&le_jump_bytes);
-            std::ptr::copy_nonoverlapping(
+            ptr::copy_nonoverlapping(
                 patch_bytes.as_ptr(),
                 self.h_proc as *mut u8,
                 patch_bytes.len(),
@@ -389,7 +396,7 @@ impl HookContext {
                 ));
             }
 
-            std::ptr::copy_nonoverlapping(
+            ptr::copy_nonoverlapping(
                 self.original_bytes.as_ptr(),
                 self.hook_start as *mut u8,
                 (self.hook_end - self.hook_start) as usize,
@@ -465,6 +472,7 @@ impl Drop for HookContext {
 #[cfg(all(test, target_arch = "x86_64"))]
 mod tests {
     use super::{HookContext, HookStatus};
+    use std::borrow::ToOwned;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 

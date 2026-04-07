@@ -1,7 +1,11 @@
-use std::{ffi::c_void, sync::atomic::AtomicU64};
+use alloc::{format, string::ToString};
+use core::{
+    ffi::c_void,
+    mem,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use magpie_process::{MemorySection, Process};
-use std::sync::Mutex;
 use windows_sys::{
     Wdk::{
         Foundation::OBJECT_ATTRIBUTES,
@@ -21,7 +25,7 @@ use windows_sys::{
 use anyhow::Result;
 
 use crate::{
-    InitializePacket, get_context, map_pe::custom_get_proc_address, set_last_error, trace,
+    InitializePacket, lock_context, map_pe::custom_get_proc_address, set_last_error, trace,
 };
 
 fn resume_process_with_og_bytes(
@@ -51,7 +55,6 @@ const THREAD_CREATE_FLAGS_CREATE_SUSPENDED: u32 = 0x0000_0001;
 
 // global mutable u64 to hold some context
 static FPTR_O_NT_CREATE_USER_PROCESS: AtomicU64 = AtomicU64::new(0);
-static NT_CREATE_USER_PROCESS_LOCK: Mutex<()> = Mutex::new(());
 
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn hooked_NtCreateUserProcess(
@@ -67,31 +70,30 @@ pub unsafe extern "system" fn hooked_NtCreateUserProcess(
     create_info: *mut c_void,
     attribute_list: *mut c_void,
 ) -> i32 {
-    let _hook_guard = NT_CREATE_USER_PROCESS_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
 
     // check if we have the quick-call fptr already
-    let fptr = FPTR_O_NT_CREATE_USER_PROCESS.load(std::sync::atomic::Ordering::SeqCst);
+    let fptr = FPTR_O_NT_CREATE_USER_PROCESS.load(Ordering::SeqCst);
     if fptr == 0 {
         // Fetch it via context lookup
-        let context = get_context();
+        let hook_trampoline = {
+            let context = lock_context();
+            context
+                .hooks
+                .iter()
+                .find(|hook| hook.target == hooked_NtCreateUserProcess as u64)
+                .map(|hook| hook.trampoline())
+        };
 
-        let hook = context
-            .hooks
-            .iter()
-            .find(|hook| hook.target == hooked_NtCreateUserProcess as u64);
-
-        let Some(hook) = hook else {
+        let Some(hook_trampoline) = hook_trampoline else {
             set_last_error("Failed to find hook context for NtCreateUserProcess".to_string());
 
             // return an NTSTATUS error to caller
             return 0xC0000002u32 as i32; // STATUS_NOT_IMPLEMENTED
         };
 
-        FPTR_O_NT_CREATE_USER_PROCESS.store(hook.trampoline(), std::sync::atomic::Ordering::SeqCst);
+        FPTR_O_NT_CREATE_USER_PROCESS.store(hook_trampoline, Ordering::SeqCst);
     }
-    let fptr = FPTR_O_NT_CREATE_USER_PROCESS.load(std::sync::atomic::Ordering::SeqCst);
+    let fptr = FPTR_O_NT_CREATE_USER_PROCESS.load(Ordering::SeqCst);
 
     let original: unsafe extern "system" fn(
         *mut HANDLE,
@@ -105,7 +107,7 @@ pub unsafe extern "system" fn hooked_NtCreateUserProcess(
         *mut c_void,
         *mut c_void,
         *mut c_void,
-    ) -> i32 = unsafe { std::mem::transmute(fptr) };
+    ) -> i32 = unsafe { mem::transmute(fptr) };
 
     let already_suspended = thread_flags & THREAD_CREATE_FLAGS_CREATE_SUSPENDED != 0;
 
@@ -293,11 +295,13 @@ pub unsafe extern "system" fn hooked_NtCreateUserProcess(
 
     // Now map our DLL in there.
     // We grab our own section first
-    let context = get_context();
-    let section_base = context.section_base;
+    let (section_base, section_name) = {
+        let context = lock_context();
+        (context.section_base, context.section_name.clone())
+    };
 
     let Ok(map) = MemorySection::open_section(
-        &context.section_name,
+        &section_name,
         SECTION_MAP_READ | SECTION_MAP_WRITE | SECTION_MAP_EXECUTE,
     ) else {
         set_last_error("Failed to open section for mapping".to_string());
@@ -352,8 +356,11 @@ pub unsafe extern "system" fn hooked_NtCreateUserProcess(
         return result;
     }
 
-    let config = match &context.config {
-        Some(config) => config,
+    let config_str = match {
+        let context = lock_context();
+        context.config.as_ref().map(|config| config.to_string())
+    } {
+        Some(config_str) => config_str,
         None => {
             set_last_error("No config found in context after mapping section".to_string());
 
@@ -373,14 +380,10 @@ pub unsafe extern "system" fn hooked_NtCreateUserProcess(
         }
     };
 
-    // Finally, grab our config, and call initialize on the remote copy of us
-    let config_str = config.to_string();
-
     // The "initialize" function is at the same address as it is in our own process
     // So we can grab section_base here, call GetProcAddress to find initialize,
     // and then call it via a function pointer cast
-    let maybe_proc_addr =
-        custom_get_proc_address(context.section_base as *mut _, "initialize_remote");
+    let maybe_proc_addr = custom_get_proc_address(section_base as *mut _, "initialize_remote");
 
     let Ok(initialize_function_address) = maybe_proc_addr else {
         set_last_error("Failed to find initialize function in mapped section".to_string());
@@ -399,8 +402,7 @@ pub unsafe extern "system" fn hooked_NtCreateUserProcess(
     };
 
     // create the packet
-    let Ok(mut initialize_packet) =
-        InitializePacket::new(&config_str, &context.section_name, context.section_base)
+    let Ok(mut initialize_packet) = InitializePacket::new(&config_str, &section_name, section_base)
     else {
         set_last_error("Failed to create initialize packet".to_string());
         if !already_suspended {

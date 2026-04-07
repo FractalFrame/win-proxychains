@@ -1,13 +1,18 @@
-use std::{
-    collections::HashSet,
+use alloc::{
+    borrow::ToOwned,
+    boxed::Box,
+    format,
+    string::String,
+    vec::Vec,
+};
+use core::{
     ffi::CStr,
-    mem::{align_of, size_of},
+    iter,
+    mem::{self, align_of, size_of},
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
-    ptr::{copy_nonoverlapping, null, null_mut},
-    sync::{
-        LazyLock, Mutex,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
-    },
+    ptr::{copy_nonoverlapping, null, null_mut, write_unaligned},
+    slice,
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
 use windows_sys::Win32::{
@@ -22,7 +27,7 @@ use windows_sys::Win32::{
     UI::WindowsAndMessaging::PostMessageW,
 };
 
-use crate::{get_context, set_last_error, trace};
+use crate::{Context, lock_context, set_last_error_in_context, trace};
 
 const DEFAULT_REMOTE_DNS_SUBNET_V4: u8 = 224;
 const DEFAULT_REMOTE_DNS_SUBNET_V6: u8 = 252;
@@ -36,35 +41,36 @@ static FPTR_O_GET_ADDR_INFOW: AtomicU64 = AtomicU64::new(0);
 static FPTR_O_FREE_ADDR_INFOW: AtomicU64 = AtomicU64::new(0);
 static NEXT_ASYNC_TASK_HANDLE: AtomicUsize = AtomicUsize::new(1);
 
-static OWNED_ADDRINFO_A_ROOTS: LazyLock<Mutex<HashSet<usize>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
-static OWNED_ADDRINFOW_ROOTS: LazyLock<Mutex<HashSet<usize>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
-
-fn cached_trampoline(cache: &AtomicU64, target: u64, function_name: &str) -> Option<u64> {
+fn cached_trampoline(
+    context: &mut Context,
+    cache: &AtomicU64,
+    target: u64,
+    function_name: &str,
+) -> Option<u64> {
     let mut trampoline = cache.load(Ordering::SeqCst);
     if trampoline != 0 {
         return Some(trampoline);
     }
 
-    let context = get_context();
-    let hook = context.hooks.iter().find(|hook| hook.target == target);
-    let Some(hook) = hook else {
-        set_last_error(format!("Failed to find hook context for {function_name}"));
+    let hook_trampoline = context
+        .hooks
+        .iter()
+        .find(|hook| hook.target == target)
+        .map(|hook| hook.trampoline());
+    let Some(hook_trampoline) = hook_trampoline else {
+        set_last_error_in_context(
+            context,
+            format!("Failed to find hook context for {function_name}"),
+        );
         return None;
     };
 
-    trampoline = hook.trampoline();
+    trampoline = hook_trampoline;
     cache.store(trampoline, Ordering::SeqCst);
     Some(trampoline)
 }
 
-pub(crate) fn seed_free_addr_info_w_trampoline(trampoline: u64) {
-    FPTR_O_FREE_ADDR_INFOW.store(trampoline, Ordering::SeqCst);
-}
-
-fn proxy_dns_enabled() -> Option<(u8, u8)> {
-    let context = get_context();
+fn proxy_dns_enabled(context: &Context) -> Option<(u8, u8)> {
     let config = context.config.as_ref()?;
     if !config.proxy_dns {
         return None;
@@ -100,30 +106,12 @@ fn next_fake_ipv6(subnet: u8, counter: &mut u128) -> Ipv6Addr {
     Ipv6Addr::from(raw.to_be_bytes())
 }
 
-fn cached_or_allocate_fake_dns_entries(name: &str) -> Option<Vec<IpAddr>> {
+fn cached_or_allocate_fake_dns_entries(context: &mut Context, name: &str) -> Option<Vec<IpAddr>> {
     if !should_proxy_dns_name(name) {
         return None;
     }
 
-    let (ipv4_subnet, ipv6_subnet) = proxy_dns_enabled()?;
-    let context = get_context();
-
-    let mut dns_cache = context
-        .dns_cache
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(addresses) = dns_cache.get(name).cloned() {
-        return Some(addresses);
-    }
-
-    let mut reverse_dns_cache = context
-        .reverse_dns_cache
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(addresses) = dns_cache.get(name).cloned() {
-        return Some(addresses);
-    }
-
+    let (ipv4_subnet, ipv6_subnet) = proxy_dns_enabled(context)?;
     let mut addresses = Vec::with_capacity(2);
     if let Some(ipv4) = next_fake_ipv4(ipv4_subnet, &mut context.ipv4_fake_counter) {
         addresses.push(IpAddr::V4(ipv4));
@@ -132,17 +120,31 @@ fn cached_or_allocate_fake_dns_entries(name: &str) -> Option<Vec<IpAddr>> {
     let ipv6 = next_fake_ipv6(ipv6_subnet, &mut context.ipv6_fake_counter);
     addresses.push(IpAddr::V6(ipv6));
 
+    {
+        let mut dns_cache = context
+            .dns_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(addresses) = dns_cache.get(name).cloned() {
+            return Some(addresses);
+        }
+        dns_cache.insert(name.to_owned(), addresses.clone());
+    }
+
+    let mut reverse_dns_cache = context
+        .reverse_dns_cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
     for address in &addresses {
         reverse_dns_cache.insert(*address, name.to_owned());
     }
-    dns_cache.insert(name.to_owned(), addresses.clone());
 
     Some(addresses)
 }
 
-pub fn reverse_fake_dns_name(name: &str) -> Option<String> {
+pub fn reverse_fake_dns_name(context: &Context, name: &str) -> Option<String> {
     let address = name.parse::<IpAddr>().ok()?;
-    let context = get_context();
     let reverse_dns_cache = context
         .reverse_dns_cache
         .lock()
@@ -184,13 +186,11 @@ unsafe fn pcwstr_to_string(value: *const u16) -> Option<String> {
         len += 1;
     }
 
-    Some(String::from_utf16_lossy(unsafe {
-        std::slice::from_raw_parts(value, len)
-    }))
+    Some(String::from_utf16_lossy(unsafe { slice::from_raw_parts(value, len) }))
 }
 
 fn wide_null(value: &str) -> Vec<u16> {
-    value.encode_utf16().chain(std::iter::once(0)).collect()
+    value.encode_utf16().chain(iter::once(0)).collect()
 }
 
 fn port_from_sockaddr(addr: *const SOCKADDR, addr_len: usize) -> Option<u16> {
@@ -217,14 +217,6 @@ fn port_from_sockaddr(addr: *const SOCKADDR, addr_len: usize) -> Option<u16> {
         }
         _ => None,
     }
-}
-
-struct OriginalAddrInfoListA {
-    raw: *mut ADDRINFOA,
-}
-
-struct OriginalAddrInfoListW {
-    raw: *mut ADDRINFOW,
 }
 
 #[derive(Clone, Copy)]
@@ -264,8 +256,11 @@ impl FakeHostentStorage {
     }
 }
 
-fn populate_thread_hostent_storage(name: &str, address: Ipv4Addr) -> *mut HOSTENT {
-    let context = get_context();
+fn populate_thread_hostent_storage(
+    context: &mut Context,
+    name: &str,
+    address: Ipv4Addr,
+) -> *mut HOSTENT {
     let thread_id = unsafe { GetCurrentThreadId() };
     let mut hostent_storage = context
         .dns_hostent_storage
@@ -293,27 +288,8 @@ struct OwnedAddrInfoW {
     canonname: Vec<u16>,
 }
 
-impl Drop for OriginalAddrInfoListA {
-    fn drop(&mut self) {
-        if !self.raw.is_null() {
-            unsafe {
-                o_freeaddrinfo(self.raw);
-            }
-        }
-    }
-}
-
-impl Drop for OriginalAddrInfoListW {
-    fn drop(&mut self) {
-        if !self.raw.is_null() {
-            unsafe {
-                o_FreeAddrInfoW(self.raw);
-            }
-        }
-    }
-}
-
 unsafe fn service_info_from_ansi(
+    context: &mut Context,
     service: *const i8,
     hints: *const ADDRINFOA,
 ) -> Result<ServiceInfo, i32> {
@@ -348,16 +324,18 @@ unsafe fn service_info_from_ansi(
     }
 
     let mut result = null_mut();
-    let status = unsafe { o_getaddrinfo(null(), service, hints, &mut result) };
+    let status = unsafe { o_getaddrinfo(context, null(), service, hints, &mut result) };
     if status != 0 {
         return Err(status);
     }
 
-    let result = OriginalAddrInfoListA { raw: result };
-    let mut cursor = result.raw;
+    let mut cursor = result;
     while !cursor.is_null() {
         let addr = unsafe { &*cursor };
         if let Some(port) = port_from_sockaddr(addr.ai_addr, addr.ai_addrlen) {
+            unsafe {
+                o_freeaddrinfo(context, result);
+            }
             return Ok(ServiceInfo {
                 port,
                 socktype: if default.socktype == 0 {
@@ -376,10 +354,15 @@ unsafe fn service_info_from_ansi(
         cursor = addr.ai_next;
     }
 
+    unsafe {
+        o_freeaddrinfo(context, result);
+    }
+
     Ok(default)
 }
 
 unsafe fn service_info_from_wide(
+    context: &mut Context,
     service: *const u16,
     hints: *const ADDRINFOW,
 ) -> Result<ServiceInfo, i32> {
@@ -414,16 +397,18 @@ unsafe fn service_info_from_wide(
     }
 
     let mut result = null_mut();
-    let status = unsafe { o_GetAddrInfoW(null(), service, hints, &mut result) };
+    let status = unsafe { o_GetAddrInfoW(context, null(), service, hints, &mut result) };
     if status != 0 {
         return Err(status);
     }
 
-    let result = OriginalAddrInfoListW { raw: result };
-    let mut cursor = result.raw;
+    let mut cursor = result;
     while !cursor.is_null() {
         let addr = unsafe { &*cursor };
         if let Some(port) = port_from_sockaddr(addr.ai_addr, addr.ai_addrlen) {
+            unsafe {
+                o_FreeAddrInfoW(context, result);
+            }
             return Ok(ServiceInfo {
                 port,
                 socktype: if default.socktype == 0 {
@@ -440,6 +425,10 @@ unsafe fn service_info_from_wide(
             });
         }
         cursor = addr.ai_next;
+    }
+
+    unsafe {
+        o_FreeAddrInfoW(context, result);
     }
 
     Ok(default)
@@ -633,6 +622,7 @@ impl OwnedAddrInfoW {
 }
 
 unsafe fn build_owned_addrinfo_a(
+    context: &mut Context,
     addresses: Vec<IpAddr>,
     name: &str,
     service: ServiceInfo,
@@ -669,10 +659,7 @@ unsafe fn build_owned_addrinfo_a(
         unsafe { &mut (*head).addrinfo as *mut ADDRINFOA }
     };
 
-    OWNED_ADDRINFO_A_ROOTS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(root as usize);
+    context.owned_addrinfo_a_roots.insert(root as usize);
     unsafe {
         *result = root;
     }
@@ -680,6 +667,7 @@ unsafe fn build_owned_addrinfo_a(
 }
 
 unsafe fn build_owned_addrinfo_w(
+    context: &mut Context,
     addresses: Vec<IpAddr>,
     name: &str,
     service: ServiceInfo,
@@ -716,10 +704,7 @@ unsafe fn build_owned_addrinfo_w(
         unsafe { &mut (*head).addrinfo as *mut ADDRINFOW }
     };
 
-    OWNED_ADDRINFOW_ROOTS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(root as usize);
+    context.owned_addrinfow_roots.insert(root as usize);
     unsafe {
         *result = root;
     }
@@ -748,11 +733,8 @@ unsafe fn free_owned_addrinfo_w(root: *const ADDRINFOW) {
     }
 }
 
-unsafe fn try_free_owned_addrinfo_alias(root: usize) -> bool {
-    let was_owned_a = OWNED_ADDRINFO_A_ROOTS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .remove(&root);
+fn try_free_owned_addrinfo_alias_in_context(context: &mut Context, root: usize) -> bool {
+    let was_owned_a = context.owned_addrinfo_a_roots.remove(&root);
     if was_owned_a {
         unsafe {
             free_owned_addrinfo_a(root as *const ADDRINFOA);
@@ -760,10 +742,7 @@ unsafe fn try_free_owned_addrinfo_alias(root: usize) -> bool {
         return true;
     }
 
-    let was_owned_w = OWNED_ADDRINFOW_ROOTS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .remove(&root);
+    let was_owned_w = context.owned_addrinfow_roots.remove(&root);
     if was_owned_w {
         unsafe {
             free_owned_addrinfo_w(root as *const ADDRINFOW);
@@ -838,7 +817,7 @@ unsafe fn write_async_hostent(
         h_addr_list: addr_list,
     };
     unsafe {
-        std::ptr::write_unaligned(buffer as *mut HOSTENT, hostent);
+        write_unaligned(buffer as *mut HOSTENT, hostent);
     }
 
     Ok(())
@@ -865,8 +844,9 @@ unsafe fn post_async_dns_completion(
     }
 }
 
-unsafe fn o_gethostbyname(name: *const i8) -> *mut HOSTENT {
+unsafe fn o_gethostbyname(context: &mut Context, name: *const i8) -> *mut HOSTENT {
     let Some(fptr) = cached_trampoline(
+        context,
         &FPTR_O_GETHOSTBYNAME,
         hooked_gethostbyname as u64,
         "gethostbyname",
@@ -875,12 +855,13 @@ unsafe fn o_gethostbyname(name: *const i8) -> *mut HOSTENT {
     };
 
     let original: unsafe extern "system" fn(*const i8) -> *mut HOSTENT =
-        unsafe { std::mem::transmute(fptr) };
+        unsafe { mem::transmute(fptr) };
     unsafe { original(name) }
 }
 
 #[allow(non_snake_case)]
 unsafe fn o_WSAAsyncGetHostByName(
+    context: &mut Context,
     hwnd: HWND,
     message: u32,
     name: *const i8,
@@ -888,6 +869,7 @@ unsafe fn o_WSAAsyncGetHostByName(
     buffer_len: i32,
 ) -> HANDLE {
     let Some(fptr) = cached_trampoline(
+        context,
         &FPTR_O_WSA_ASYNC_GET_HOST_BY_NAME,
         hooked_WSAAsyncGetHostByName as u64,
         "WSAAsyncGetHostByName",
@@ -904,17 +886,19 @@ unsafe fn o_WSAAsyncGetHostByName(
     };
 
     let original: unsafe extern "system" fn(HWND, u32, *const i8, *mut i8, i32) -> HANDLE =
-        unsafe { std::mem::transmute(fptr) };
+        unsafe { mem::transmute(fptr) };
     unsafe { original(hwnd, message, name, buffer, buffer_len) }
 }
 
 unsafe fn o_getaddrinfo(
+    context: &mut Context,
     node_name: *const i8,
     service_name: *const i8,
     hints: *const ADDRINFOA,
     result: *mut *mut ADDRINFOA,
 ) -> i32 {
     let Some(fptr) = cached_trampoline(
+        context,
         &FPTR_O_GETADDRINFO,
         hooked_getaddrinfo as u64,
         "getaddrinfo",
@@ -934,12 +918,13 @@ unsafe fn o_getaddrinfo(
         *const i8,
         *const ADDRINFOA,
         *mut *mut ADDRINFOA,
-    ) -> i32 = unsafe { std::mem::transmute(fptr) };
+    ) -> i32 = unsafe { mem::transmute(fptr) };
     unsafe { original(node_name, service_name, hints, result) }
 }
 
-unsafe fn o_freeaddrinfo(result: *const ADDRINFOA) {
+unsafe fn o_freeaddrinfo(context: &mut Context, result: *const ADDRINFOA) {
     let Some(fptr) = cached_trampoline(
+        context,
         &FPTR_O_FREEADDRINFO,
         hooked_freeaddrinfo as u64,
         "freeaddrinfo",
@@ -951,18 +936,20 @@ unsafe fn o_freeaddrinfo(result: *const ADDRINFOA) {
     };
 
     let original: unsafe extern "system" fn(*const ADDRINFOA) =
-        unsafe { std::mem::transmute(fptr) };
+        unsafe { mem::transmute(fptr) };
     unsafe { original(result) }
 }
 
 #[allow(non_snake_case)]
 pub unsafe fn o_GetAddrInfoW(
+    context: &mut Context,
     node_name: *const u16,
     service_name: *const u16,
     hints: *const ADDRINFOW,
     result: *mut *mut ADDRINFOW,
 ) -> i32 {
     let Some(fptr) = cached_trampoline(
+        context,
         &FPTR_O_GET_ADDR_INFOW,
         hooked_GetAddrInfoW as u64,
         "GetAddrInfoW",
@@ -975,13 +962,14 @@ pub unsafe fn o_GetAddrInfoW(
         *const u16,
         *const ADDRINFOW,
         *mut *mut ADDRINFOW,
-    ) -> i32 = unsafe { std::mem::transmute(fptr) };
+    ) -> i32 = unsafe { mem::transmute(fptr) };
     unsafe { original(node_name, service_name, hints, result) }
 }
 
 #[allow(non_snake_case)]
-pub unsafe fn o_FreeAddrInfoW(result: *const ADDRINFOW) {
+pub unsafe fn o_FreeAddrInfoW(context: &mut Context, result: *const ADDRINFOW) {
     let Some(fptr) = cached_trampoline(
+        context,
         &FPTR_O_FREE_ADDR_INFOW,
         hooked_FreeAddrInfoW as u64,
         "FreeAddrInfoW",
@@ -993,22 +981,23 @@ pub unsafe fn o_FreeAddrInfoW(result: *const ADDRINFOW) {
     };
 
     let original: unsafe extern "system" fn(*const ADDRINFOW) =
-        unsafe { std::mem::transmute(fptr) };
+        unsafe { mem::transmute(fptr) };
     unsafe { original(result) }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn hooked_gethostbyname(name: *const i8) -> *mut HOSTENT {
+    let mut context = lock_context();
     let Some(name_string) = (unsafe { pcstr_to_string(name) }) else {
-        return unsafe { o_gethostbyname(name) };
+        return unsafe { o_gethostbyname(&mut context, name) };
     };
     trace::log(format!("hooked_gethostbyname name={name_string}"));
 
-    let Some(addresses) = cached_or_allocate_fake_dns_entries(&name_string) else {
+    let Some(addresses) = cached_or_allocate_fake_dns_entries(&mut context, &name_string) else {
         trace::log(format!(
             "hooked_gethostbyname passthrough name={name_string}"
         ));
-        return unsafe { o_gethostbyname(name) };
+        return unsafe { o_gethostbyname(&mut context, name) };
     };
 
     let Some(ipv4) = addresses.into_iter().find_map(|address| match address {
@@ -1027,7 +1016,7 @@ pub unsafe extern "system" fn hooked_gethostbyname(name: *const i8) -> *mut HOST
         "hooked_gethostbyname fabricated name={name_string} ipv4={ipv4}"
     ));
 
-    populate_thread_hostent_storage(&name_string, ipv4)
+    populate_thread_hostent_storage(&mut context, &name_string, ipv4)
 }
 
 #[unsafe(no_mangle)]
@@ -1038,19 +1027,24 @@ pub unsafe extern "system" fn hooked_WSAAsyncGetHostByName(
     buffer: *mut i8,
     buffer_len: i32,
 ) -> HANDLE {
+    let mut context = lock_context();
     let Some(name_string) = (unsafe { pcstr_to_string(name) }) else {
-        return unsafe { o_WSAAsyncGetHostByName(hwnd, message, name, buffer, buffer_len) };
+        return unsafe {
+            o_WSAAsyncGetHostByName(&mut context, hwnd, message, name, buffer, buffer_len)
+        };
     };
     trace::log(format!(
         "hooked_WSAAsyncGetHostByName name={} buffer={buffer:p} buffer_len={}",
         name_string, buffer_len
     ));
 
-    let Some(addresses) = cached_or_allocate_fake_dns_entries(&name_string) else {
+    let Some(addresses) = cached_or_allocate_fake_dns_entries(&mut context, &name_string) else {
         trace::log(format!(
             "hooked_WSAAsyncGetHostByName passthrough name={name_string}"
         ));
-        return unsafe { o_WSAAsyncGetHostByName(hwnd, message, name, buffer, buffer_len) };
+        return unsafe {
+            o_WSAAsyncGetHostByName(&mut context, hwnd, message, name, buffer, buffer_len)
+        };
     };
 
     if buffer.is_null() || buffer_len < 0 {
@@ -1125,8 +1119,9 @@ pub unsafe extern "system" fn hooked_getaddrinfo(
     hints: *const ADDRINFOA,
     result: *mut *mut ADDRINFOA,
 ) -> i32 {
+    let mut context = lock_context();
     let Some(name_string) = (unsafe { pcstr_to_string(node_name) }) else {
-        return unsafe { o_getaddrinfo(node_name, service_name, hints, result) };
+        return unsafe { o_getaddrinfo(&mut context, node_name, service_name, hints, result) };
     };
     trace::log(format!("hooked_getaddrinfo node={name_string}"));
 
@@ -1143,12 +1138,12 @@ pub unsafe extern "system" fn hooked_getaddrinfo(
             "hooked_getaddrinfo passthrough node={} family={requested_family}",
             name_string
         ));
-        return unsafe { o_getaddrinfo(node_name, service_name, hints, result) };
+        return unsafe { o_getaddrinfo(&mut context, node_name, service_name, hints, result) };
     }
 
-    let Some(addresses) = cached_or_allocate_fake_dns_entries(&name_string) else {
+    let Some(addresses) = cached_or_allocate_fake_dns_entries(&mut context, &name_string) else {
         trace::log(format!("hooked_getaddrinfo passthrough node={name_string}"));
-        return unsafe { o_getaddrinfo(node_name, service_name, hints, result) };
+        return unsafe { o_getaddrinfo(&mut context, node_name, service_name, hints, result) };
     };
 
     let filtered = filter_fake_dns_addresses(addresses, requested_family);
@@ -1165,7 +1160,7 @@ pub unsafe extern "system" fn hooked_getaddrinfo(
         return WSANO_DATA as i32;
     }
 
-    let service = match unsafe { service_info_from_ansi(service_name, hints) } {
+    let service = match unsafe { service_info_from_ansi(&mut context, service_name, hints) } {
         Ok(service) => service,
         Err(status) => {
             if !result.is_null() {
@@ -1183,7 +1178,7 @@ pub unsafe extern "system" fn hooked_getaddrinfo(
         requested_family,
         filtered.len()
     ));
-    unsafe { build_owned_addrinfo_a(filtered, &name_string, service, result) }
+    unsafe { build_owned_addrinfo_a(&mut context, filtered, &name_string, service, result) }
 }
 
 #[unsafe(no_mangle)]
@@ -1193,8 +1188,9 @@ pub unsafe extern "system" fn hooked_GetAddrInfoW(
     hints: *const ADDRINFOW,
     result: *mut *mut ADDRINFOW,
 ) -> i32 {
+    let mut context = lock_context();
     let Some(name_string) = (unsafe { pcwstr_to_string(node_name) }) else {
-        return unsafe { o_GetAddrInfoW(node_name, service_name, hints, result) };
+        return unsafe { o_GetAddrInfoW(&mut context, node_name, service_name, hints, result) };
     };
     trace::log(format!("hooked_GetAddrInfoW node={name_string}"));
 
@@ -1211,14 +1207,14 @@ pub unsafe extern "system" fn hooked_GetAddrInfoW(
             "hooked_GetAddrInfoW passthrough node={} family={requested_family}",
             name_string
         ));
-        return unsafe { o_GetAddrInfoW(node_name, service_name, hints, result) };
+        return unsafe { o_GetAddrInfoW(&mut context, node_name, service_name, hints, result) };
     }
 
-    let Some(addresses) = cached_or_allocate_fake_dns_entries(&name_string) else {
+    let Some(addresses) = cached_or_allocate_fake_dns_entries(&mut context, &name_string) else {
         trace::log(format!(
             "hooked_GetAddrInfoW passthrough node={name_string}"
         ));
-        return unsafe { o_GetAddrInfoW(node_name, service_name, hints, result) };
+        return unsafe { o_GetAddrInfoW(&mut context, node_name, service_name, hints, result) };
     };
 
     let filtered = filter_fake_dns_addresses(addresses, requested_family);
@@ -1235,7 +1231,7 @@ pub unsafe extern "system" fn hooked_GetAddrInfoW(
         return WSANO_DATA as i32;
     }
 
-    let service = match unsafe { service_info_from_wide(service_name, hints) } {
+    let service = match unsafe { service_info_from_wide(&mut context, service_name, hints) } {
         Ok(service) => service,
         Err(status) => {
             if !result.is_null() {
@@ -1253,17 +1249,18 @@ pub unsafe extern "system" fn hooked_GetAddrInfoW(
         requested_family,
         filtered.len()
     ));
-    unsafe { build_owned_addrinfo_w(filtered, &name_string, service, result) }
+    unsafe { build_owned_addrinfo_w(&mut context, filtered, &name_string, service, result) }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn hooked_freeaddrinfo(result: *const ADDRINFOA) {
+    let mut context = lock_context();
     if result.is_null() {
         return;
     }
 
     let root = result as usize;
-    let was_owned = unsafe { try_free_owned_addrinfo_alias(root) };
+    let was_owned = try_free_owned_addrinfo_alias_in_context(&mut context, root);
     trace::log(format!(
         "hooked_freeaddrinfo result={result:p} owned={was_owned}"
     ));
@@ -1272,18 +1269,19 @@ pub unsafe extern "system" fn hooked_freeaddrinfo(result: *const ADDRINFOA) {
     }
 
     unsafe {
-        o_freeaddrinfo(result);
+        o_freeaddrinfo(&mut context, result);
     }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn hooked_FreeAddrInfoW(result: *const ADDRINFOW) {
+    let mut context = lock_context();
     if result.is_null() {
         return;
     }
 
     let root = result as usize;
-    let was_owned = unsafe { try_free_owned_addrinfo_alias(root) };
+    let was_owned = try_free_owned_addrinfo_alias_in_context(&mut context, root);
     trace::log(format!(
         "hooked_FreeAddrInfoW result={result:p} owned={was_owned}"
     ));
@@ -1292,7 +1290,7 @@ pub unsafe extern "system" fn hooked_FreeAddrInfoW(result: *const ADDRINFOW) {
     }
 
     unsafe {
-        o_FreeAddrInfoW(result);
+        o_FreeAddrInfoW(&mut context, result);
     }
 }
 
@@ -1302,11 +1300,14 @@ mod tests {
         MAX_FAKE_IPV4_REQUESTS, async_hostent_size, cached_or_allocate_fake_dns_entries,
         reverse_fake_dns_name, write_async_hostent,
     };
-    use crate::get_context;
+    use crate::lock_context;
     use std::{
         ffi::CStr,
         net::{IpAddr, Ipv4Addr, Ipv6Addr},
+        ptr::null_mut,
         sync::Mutex,
+        string::ToString,
+        vec,
     };
     use windows_sys::Win32::Networking::WinSock::HOSTENT;
 
@@ -1319,7 +1320,7 @@ mod tests {
     }
 
     fn reset_dns_state() {
-        let context = get_context();
+        let mut context = lock_context();
         context.ipv4_fake_counter = 0;
         context.ipv6_fake_counter = 0;
         context
@@ -1332,6 +1333,8 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
+        context.owned_addrinfo_a_roots.clear();
+        context.owned_addrinfow_roots.clear();
         context.config = Some(
             crate::config::ProxychainsConfig::parse(
                 "strict_chain\nproxy_dns\nremote_dns_subnet 224\nremote_dns_subnet_6 252\n[ProxyList]\nsocks5 127.0.0.1 1080\n",
@@ -1344,10 +1347,11 @@ mod tests {
     fn fake_dns_lookup_caches_forward_and_reverse_entries() {
         let _guard = lock_tests();
         reset_dns_state();
+        let mut context = lock_context();
 
-        let first = cached_or_allocate_fake_dns_entries("example.com")
+        let first = cached_or_allocate_fake_dns_entries(&mut context, "example.com")
             .expect("proxy_dns should fabricate a mapping");
-        let second = cached_or_allocate_fake_dns_entries("example.com")
+        let second = cached_or_allocate_fake_dns_entries(&mut context, "example.com")
             .expect("cached lookup should succeed");
 
         assert_eq!(first, second);
@@ -1359,11 +1363,11 @@ mod tests {
             ]
         );
         assert_eq!(
-            reverse_fake_dns_name("224.0.0.1").as_deref(),
+            reverse_fake_dns_name(&context, "224.0.0.1").as_deref(),
             Some("example.com")
         );
         assert_eq!(
-            reverse_fake_dns_name("fc00::1").as_deref(),
+            reverse_fake_dns_name(&context, "fc00::1").as_deref(),
             Some("example.com")
         );
     }
@@ -1373,16 +1377,16 @@ mod tests {
         let _guard = lock_tests();
         reset_dns_state();
 
-        let context = get_context();
+        let mut context = lock_context();
         context.ipv4_fake_counter = MAX_FAKE_IPV4_REQUESTS;
 
-        let addresses = cached_or_allocate_fake_dns_entries("ipv6-only.example")
+        let addresses = cached_or_allocate_fake_dns_entries(&mut context, "ipv6-only.example")
             .expect("proxy_dns should still fabricate IPv6 mappings");
 
         assert_eq!(addresses.len(), 1);
         assert!(matches!(addresses[0], IpAddr::V6(_)));
         assert_eq!(
-            reverse_fake_dns_name(&addresses[0].to_string()).as_deref(),
+            reverse_fake_dns_name(&context, &addresses[0].to_string()).as_deref(),
             Some("ipv6-only.example")
         );
     }
@@ -1418,5 +1422,59 @@ mod tests {
         assert!(unsafe { *addr_list.add(1) }.is_null());
         let addr = unsafe { std::slice::from_raw_parts(*addr_list as *const u8, 4) };
         assert_eq!(addr, &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn owned_addrinfo_roots_live_in_context() {
+        let _guard = lock_tests();
+        reset_dns_state();
+
+        let mut context = lock_context();
+        let service = super::ServiceInfo {
+            port: 443,
+            socktype: 0,
+            protocol: 0,
+            flags: 0,
+        };
+        let mut result_a = null_mut();
+        let mut result_w = null_mut();
+
+        unsafe {
+            assert_eq!(
+                super::build_owned_addrinfo_a(
+                    &mut context,
+                    vec![IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1))],
+                    "example.com",
+                    service,
+                    &mut result_a,
+                ),
+                0
+            );
+            assert_eq!(
+                super::build_owned_addrinfo_w(
+                    &mut context,
+                    vec![IpAddr::V6(Ipv6Addr::LOCALHOST)],
+                    "example.com",
+                    service,
+                    &mut result_w,
+                ),
+                0
+            );
+        }
+
+        assert!(context.owned_addrinfo_a_roots.contains(&(result_a as usize)));
+        assert!(context.owned_addrinfow_roots.contains(&(result_w as usize)));
+
+        assert!(super::try_free_owned_addrinfo_alias_in_context(
+            &mut context,
+            result_a as usize,
+        ));
+        assert!(super::try_free_owned_addrinfo_alias_in_context(
+            &mut context,
+            result_w as usize,
+        ));
+
+        assert!(context.owned_addrinfo_a_roots.is_empty());
+        assert!(context.owned_addrinfow_roots.is_empty());
     }
 }

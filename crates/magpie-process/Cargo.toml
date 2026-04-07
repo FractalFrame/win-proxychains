@@ -2,14 +2,21 @@
 name = "magpie-process"
 version = "0.1.0"
 edition.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["global-allocator"]
+global-allocator = []
 
 [dependencies]
-anyhow.workspace = true
+anyhow = { version = "*", default-features = false }
+winapi-allocator.workspace = true
 
 [dependencies.windows-sys]
 workspace = true
 features = [
     "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
     "Wdk_System_Memory",
     "Wdk_System_SystemServices",
     "Wdk_System_Threading",

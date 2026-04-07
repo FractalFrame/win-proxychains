@@ -2,7 +2,6 @@
 
 use std::{
     ops::Range,
-    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -20,13 +19,13 @@ use windows_sys::Win32::System::Memory::{
     SECTION_MAP_READ, SECTION_MAP_WRITE,
 };
 
-fn notepad_path() -> PathBuf {
-    let windir = std::env::var_os("WINDIR").unwrap_or_else(|| "C:\\Windows".into());
-    PathBuf::from(windir).join("System32").join("notepad.exe")
+fn notepad_path() -> String {
+    let windir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".to_string());
+    format!("{windir}\\System32\\notepad.exe")
 }
 
 fn find_main_module<'a>(process: &Process, modules: &'a [ModuleInfo]) -> Result<&'a ModuleInfo> {
-    let process_name = notepad_path()
+    let process_name = std::path::Path::new(&notepad_path())
         .file_name()
         .ok_or_else(|| anyhow!("notepad path has no file name"))?
         .to_string_lossy()
@@ -35,8 +34,7 @@ fn find_main_module<'a>(process: &Process, modules: &'a [ModuleInfo]) -> Result<
     modules
         .iter()
         .find(|module| {
-            module
-                .path
+            std::path::Path::new(&module.path)
                 .file_name()
                 .map(|name| name.to_string_lossy().eq_ignore_ascii_case(&process_name))
                 .unwrap_or(false)
@@ -113,8 +111,8 @@ unsafe extern "system" fn test_remote_thread_main(parameter: *mut core::ffi::c_v
 #[test]
 fn open_process_without_debugger_supports_generic_inspection() -> Result<()> {
     let notepad = notepad_path();
-    if !notepad.exists() {
-        bail!("notepad not found at {}", notepad.display());
+    if !std::path::Path::new(&notepad).exists() {
+        bail!("notepad not found at {}", notepad);
     }
 
     let launched = ProcessBuilder::new(notepad)
@@ -151,7 +149,7 @@ fn open_process_without_debugger_supports_generic_inspection() -> Result<()> {
             .ok_or_else(|| {
                 anyhow!(
                     "failed to locate .text section in {}",
-                    main_module.path.display()
+                    main_module.path.as_str()
                 )
             })?;
 
@@ -270,8 +268,8 @@ fn open_current_process_can_create_remote_thread() -> Result<()> {
 #[test]
 fn section_mapping_is_visible_across_processes() -> Result<()> {
     let notepad = notepad_path();
-    if !notepad.exists() {
-        bail!("notepad not found at {}", notepad.display());
+    if !std::path::Path::new(&notepad).exists() {
+        bail!("notepad not found at {}", notepad);
     }
 
     let launched = ProcessBuilder::new(notepad)

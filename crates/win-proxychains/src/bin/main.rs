@@ -599,7 +599,7 @@ fn load_pe_in_current_process(path: &Path) -> Result<(u64, MemorySection)> {
         CString::new("ntdll.dll").expect("CString::new on a string literal should not fail");
     let ntdll_module = unsafe { GetModuleHandleA(ntdll_name.as_ptr() as *const u8) } as u64;
 
-    map_and_load_pe(path, &[ntdll_module, winsock_module, dns_api_module])
+    map_and_load_pe(&path.to_string_lossy(), &[ntdll_module, winsock_module, dns_api_module])
         .with_context(|| format!("failed to map PE into current process: {}", path.display()))
 }
 

@@ -1,14 +1,19 @@
 // Copyright (c) 2026 FractalFrame <https://fractalframe.eu>
 // Part of the win-proxychains project. Licensed under BSL-1.1; see LICENCE.md.
 
-use std::{
+use alloc::{
+    boxed::Box,
+    collections::BTreeMap,
+    format,
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
+use core::{
     cmp::Ordering,
-    collections::{BTreeMap, HashMap},
-    ffi::{OsString, c_void},
+    ffi::c_void,
     mem,
     ops::Range,
-    os::windows::ffi::OsStrExt,
-    path::PathBuf,
 };
 
 use anyhow::Result;
@@ -47,10 +52,11 @@ use windows_sys::{
             SystemInformation::{GetSystemInfo, SYSTEM_INFO},
             Threading::{
                 CreateProcessW, CreateRemoteThread, GetExitCodeProcess, OpenProcess, OpenThread,
-                PROCESS_BASIC_INFORMATION, PROCESS_CREATE_THREAD, PROCESS_INFORMATION,
-                PROCESS_QUERY_INFORMATION, PROCESS_TERMINATE, PROCESS_VM_OPERATION,
-                PROCESS_VM_READ, PROCESS_VM_WRITE, ResumeThread, STARTUPINFOW, SuspendThread,
-                THREAD_GET_CONTEXT, THREAD_SET_CONTEXT, THREAD_SUSPEND_RESUME, TerminateProcess,
+                GetCurrentProcessId, PROCESS_BASIC_INFORMATION, PROCESS_CREATE_THREAD,
+                PROCESS_INFORMATION, PROCESS_QUERY_INFORMATION, PROCESS_TERMINATE,
+                PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE, ResumeThread,
+                STARTUPINFOW, SuspendThread, THREAD_GET_CONTEXT, THREAD_SET_CONTEXT,
+                THREAD_SUSPEND_RESUME, TerminateProcess,
             },
         },
     },
@@ -297,15 +303,15 @@ impl MemorySection {
 
 #[derive(Debug, Clone)]
 pub struct ProcessBuilder {
-    program: PathBuf,
-    arguments: Vec<OsString>,
-    environment: Option<HashMap<OsString, OsString>>,
-    working_directory: Option<PathBuf>,
+    program: String,
+    arguments: Vec<String>,
+    environment: Option<BTreeMap<String, String>>,
+    working_directory: Option<String>,
     creation_flags: u32,
 }
 
 impl ProcessBuilder {
-    pub fn new(program: PathBuf) -> Self {
+    pub fn new(program: String) -> Self {
         Self {
             program,
             arguments: Vec::new(),
@@ -315,22 +321,22 @@ impl ProcessBuilder {
         }
     }
 
-    pub fn arguments(mut self, args: Vec<OsString>) -> Self {
+    pub fn arguments(mut self, args: Vec<String>) -> Self {
         self.arguments = args;
         self
     }
 
-    pub fn add_argument(mut self, arg: OsString) -> Self {
+    pub fn add_argument(mut self, arg: String) -> Self {
         self.arguments.push(arg);
         self
     }
 
-    pub fn environment(mut self, env: HashMap<OsString, OsString>) -> Self {
+    pub fn environment(mut self, env: BTreeMap<String, String>) -> Self {
         self.environment = Some(env);
         self
     }
 
-    pub fn working_directory(mut self, dir: PathBuf) -> Self {
+    pub fn working_directory(mut self, dir: String) -> Self {
         self.working_directory = Some(dir);
         self
     }
@@ -342,15 +348,10 @@ impl ProcessBuilder {
 
     pub fn start(&self) -> Result<Process> {
         let command_line = build_command_line(&self.program, &self.arguments);
-        let mut command_line_wide: Vec<u16> = command_line.encode_wide().collect();
-        command_line_wide.push(0);
+        let mut command_line_wide = utf16_nul(&command_line);
 
         let env_block = self.environment.as_ref().map(build_environment_block);
-        let working_dir_wide = self.working_directory.as_ref().map(|path| {
-            let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
-            wide.push(0);
-            wide
-        });
+        let working_dir_wide = self.working_directory.as_ref().map(|path| utf16_nul(path));
 
         let mut startup_info: STARTUPINFOW = unsafe { mem::zeroed() };
         startup_info.cb = mem::size_of::<STARTUPINFOW>() as u32;
@@ -474,7 +475,7 @@ impl Process {
                 self.process_handle.raw(),
                 core::ptr::null(),
                 stack_size,
-                Some(std::mem::transmute::<
+                Some(mem::transmute::<
                     usize,
                     unsafe extern "system" fn(*mut core::ffi::c_void) -> u32,
                 >(start_address as usize)),
@@ -596,11 +597,9 @@ impl Process {
         while success != 0 {
             if entry.th32ProcessID == self.process_id {
                 modules.push(ModuleInfo {
-                    path: PathBuf::from(
-                        String::from_utf16_lossy(&entry.szExePath)
-                            .trim_end_matches('\0')
-                            .to_string(),
-                    ),
+                    path: String::from_utf16_lossy(&entry.szExePath)
+                        .trim_end_matches('\0')
+                        .to_string(),
                     base_address: entry.modBaseAddr as u64,
                     size: Some(entry.modBaseSize as usize),
                 });
@@ -865,7 +864,7 @@ impl Thread {
 
 #[derive(Debug, Clone)]
 pub struct ModuleInfo {
-    pub path: PathBuf,
+    pub path: String,
     pub base_address: u64,
     pub size: Option<usize>,
 }
@@ -894,8 +893,7 @@ impl ModuleInfo {
             .read_memory_at(self.base_address, image_size)?
             .into_boxed_slice();
         let parsed = ParsedPeFile::parse(&backing)?;
-        let parsed =
-            unsafe { std::mem::transmute::<ParsedPeFile<'_>, ParsedPeFile<'static>>(parsed) };
+        let parsed = unsafe { mem::transmute::<ParsedPeFile<'_>, ParsedPeFile<'static>>(parsed) };
 
         Ok(AnalysedModuleInfo {
             module: ModuleInfo {
@@ -913,13 +911,13 @@ impl ModuleInfo {
         if dos_header.len() < DOS_HEADER_LEN {
             return Err(anyhow::anyhow!(
                 "module at {} is too small to contain a DOS header",
-                self.path.display()
+                self.path.as_str()
             ));
         }
         if dos_header[..2] != DOS_MAGIC {
             return Err(anyhow::anyhow!(
                 "module at {} does not start with an MZ header",
-                self.path.display()
+                self.path.as_str()
             ));
         }
 
@@ -931,7 +929,7 @@ impl ModuleInfo {
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "module at {} has an overflowing PE header offset",
-                    self.path.display()
+                    self.path.as_str()
                 )
             })?;
 
@@ -939,13 +937,13 @@ impl ModuleInfo {
             if nt_headers_end > known_size {
                 return Err(anyhow::anyhow!(
                     "module at {} reports NT headers outside the known image size",
-                    self.path.display()
+                    self.path.as_str()
                 ));
             }
         } else if nt_headers_end > MAX_REMOTE_HEADER_PROBE {
             return Err(anyhow::anyhow!(
                 "module at {} has an implausibly distant NT header offset ({:#x})",
-                self.path.display(),
+                self.path.as_str(),
                 e_lfanew
             ));
         }
@@ -954,13 +952,13 @@ impl ModuleInfo {
         if nt_probe.len() < nt_headers_end {
             return Err(anyhow::anyhow!(
                 "module at {} did not yield enough bytes to cover its NT headers",
-                self.path.display()
+                self.path.as_str()
             ));
         }
         if nt_probe[e_lfanew..e_lfanew + NT_SIGNATURE_LEN] != PE_SIGNATURE {
             return Err(anyhow::anyhow!(
                 "module at {} does not contain a valid PE signature",
-                self.path.display()
+                self.path.as_str()
             ));
         }
 
@@ -972,7 +970,7 @@ impl ModuleInfo {
         if size_of_optional_header < MIN_OPTIONAL_HEADER_FOR_SIZE_OF_IMAGE {
             return Err(anyhow::anyhow!(
                 "module at {} has an optional header too small for SizeOfImage",
-                self.path.display()
+                self.path.as_str()
             ));
         }
 
@@ -986,7 +984,7 @@ impl ModuleInfo {
         {
             return Err(anyhow::anyhow!(
                 "module at {} has an unsupported PE optional header magic {:#x}",
-                self.path.display(),
+                self.path.as_str(),
                 optional_header_magic
             ));
         }
@@ -998,7 +996,7 @@ impl ModuleInfo {
         if image_size == 0 {
             return Err(anyhow::anyhow!(
                 "module at {} reported a zero image size",
-                self.path.display()
+                self.path.as_str()
             ));
         }
 
@@ -1006,42 +1004,46 @@ impl ModuleInfo {
     }
 }
 
-fn build_command_line(program: &PathBuf, arguments: &[OsString]) -> OsString {
-    let mut command_line = OsString::new();
-    let program_str = program.as_os_str();
-    if program_str.to_string_lossy().contains(' ') {
-        command_line.push("\"");
-        command_line.push(program_str);
-        command_line.push("\"");
+fn build_command_line(program: &str, arguments: &[String]) -> String {
+    let mut command_line = String::new();
+    if program.contains(' ') {
+        command_line.push('"');
+        command_line.push_str(program);
+        command_line.push('"');
     } else {
-        command_line.push(program_str);
+        command_line.push_str(program);
     }
 
     for arg in arguments {
-        command_line.push(" ");
-        let arg_str = arg.to_string_lossy();
-        if arg_str.contains(' ') || arg_str.contains('"') {
-            command_line.push("\"");
-            command_line.push(&arg_str.replace('"', "\\\""));
-            command_line.push("\"");
+        command_line.push(' ');
+        if arg.contains(' ') || arg.contains('"') {
+            command_line.push('"');
+            command_line.push_str(&arg.replace('"', "\\\""));
+            command_line.push('"');
         } else {
-            command_line.push(arg);
+            command_line.push_str(arg);
         }
     }
 
     command_line
 }
 
-fn build_environment_block(env: &HashMap<OsString, OsString>) -> Vec<u16> {
+fn build_environment_block(env: &BTreeMap<String, String>) -> Vec<u16> {
     let mut block = Vec::new();
     for (key, value) in env {
-        block.extend(key.encode_wide());
+        block.extend(key.encode_utf16());
         block.push('=' as u16);
-        block.extend(value.encode_wide());
+        block.extend(value.encode_utf16());
         block.push(0);
     }
     block.push(0);
     block
+}
+
+fn utf16_nul(text: &str) -> Vec<u16> {
+    let mut wide: Vec<u16> = text.encode_utf16().collect();
+    wide.push(0);
+    wide
 }
 
 fn normalize_section_name(name: &str) -> Result<String> {
@@ -1068,7 +1070,7 @@ fn normalize_section_name(name: &str) -> Result<String> {
 
 fn current_session_id() -> Result<u32> {
     let mut session_id = 0u32;
-    let result = unsafe { ProcessIdToSessionId(std::process::id(), &mut session_id) };
+    let result = unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session_id) };
     if result == 0 {
         return bail_with_last_error("ProcessIdToSessionId failed");
     }

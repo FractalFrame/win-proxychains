@@ -1,7 +1,22 @@
+use alloc::{
+    ffi::CString,
+    format,
+    string::ToString,
+    vec,
+    vec::Vec,
+};
+use core::{ffi::c_void, iter, mem, ptr};
+
 use anyhow::Result;
 use magpie_process::{MemorySection, ParsedNtHeaders, ParsedPeFile, Process};
-use std::{ffi::CString, mem, path::Path};
-use windows_sys::Win32::System::Memory::PAGE_EXECUTE_WRITECOPY;
+use windows_sys::Win32::{
+    Foundation::{CloseHandle, GENERIC_READ, INVALID_HANDLE_VALUE},
+    Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, GetFileSizeEx, OPEN_EXISTING,
+        ReadFile,
+    },
+    System::Memory::PAGE_EXECUTE_WRITECOPY,
+};
 use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
 use windows_sys::Win32::System::SystemServices::{
     DLL_PROCESS_ATTACH, IMAGE_BASE_RELOCATION, IMAGE_EXPORT_DIRECTORY, IMAGE_REL_BASED_ABSOLUTE,
@@ -10,9 +25,72 @@ use windows_sys::Win32::System::SystemServices::{
 use windows_sys::Win32::System::{
     LibraryLoader::{GetProcAddress, LoadLibraryA},
     Memory::{PAGE_EXECUTE_READWRITE, SECTION_MAP_EXECUTE, SECTION_MAP_READ, SECTION_MAP_WRITE},
+    SystemInformation::GetTickCount64,
+    Threading::GetCurrentProcessId,
 };
 
 use crate::bail_with_last_error;
+
+fn wide_null(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(iter::once(0)).collect()
+}
+
+fn basename(path: &str) -> &str {
+    path.rsplit(['\\', '/']).next().unwrap_or(path)
+}
+
+fn read_file(path: &str) -> Result<Vec<u8>> {
+    let path_wide = wide_null(path);
+    let handle = unsafe {
+        CreateFileW(
+            path_wide.as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_READ,
+            core::ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            core::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return bail_with_last_error("failed to open PE file");
+    }
+
+    let result = (|| -> Result<Vec<u8>> {
+        let mut file_size = 0i64;
+        if unsafe { GetFileSizeEx(handle, &mut file_size) } == 0 {
+            return bail_with_last_error("failed to query PE file size");
+        }
+
+        let file_size = usize::try_from(file_size)
+            .map_err(|_| anyhow::anyhow!("PE file size does not fit in usize"))?;
+        let mut bytes = vec![0u8; file_size];
+        let mut bytes_read = 0u32;
+        if file_size != 0
+            && unsafe {
+                ReadFile(
+                    handle,
+                    bytes.as_mut_ptr(),
+                    u32::try_from(file_size)
+                        .map_err(|_| anyhow::anyhow!("PE file exceeds 4 GiB"))?,
+                    &mut bytes_read,
+                    core::ptr::null_mut(),
+                )
+            } == 0
+        {
+            return bail_with_last_error("failed to read PE file");
+        }
+
+        bytes.truncate(bytes_read as usize);
+        Ok(bytes)
+    })();
+
+    unsafe {
+        CloseHandle(handle);
+    }
+
+    result
+}
 
 // This function takes a PE file and maps it into memory.
 // It takes a path to the PE file and returns a MemorySection containing the mapped image.
@@ -21,11 +99,11 @@ use crate::bail_with_last_error;
 // We go through all this copy, and not just a generic .dll injection, because we want to use rel_32 offsets in our jump hooks
 // And to do that we need to restrict the mapping address to a base address in range of the required bases
 pub fn map_and_load_pe(
-    path: &Path,
+    path: &str,
     required_bases_in_range: &[u64],
 ) -> Result<(u64, MemorySection)> {
-    let pe_bytes = std::fs::read(path)
-        .map_err(|e| anyhow::anyhow!("failed to read PE file: {path:?}: {e}"))?;
+    let pe_bytes = read_file(path)
+        .map_err(|e| anyhow::anyhow!("failed to read PE file {path}: {e}"))?;
     let pe = ParsedPeFile::parse(&pe_bytes)?;
     let sections = pe.sections()?;
 
@@ -38,16 +116,11 @@ pub fn map_and_load_pe(
     let allocation_granularity = system_info.dwAllocationGranularity as usize;
     image_size = (image_size + allocation_granularity - 1) & !(allocation_granularity - 1);
 
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| anyhow::anyhow!("failed to get current timestamp: {e}"))?
-        .as_nanos();
+    let timestamp = unsafe { GetTickCount64() };
 
     let name = format!(
         "win-proxy-section-{}-{}",
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("mapped_pe"),
+        basename(path),
         timestamp
     );
 
@@ -59,7 +132,7 @@ pub fn map_and_load_pe(
     )
     .map_err(|e| anyhow::anyhow!("failed to create memory section: {e}"))?;
 
-    let current_process = Process::open(std::process::id())
+    let current_process = Process::open(unsafe { GetCurrentProcessId() })
         .map_err(|e| anyhow::anyhow!("failed to open current process: {e}"))?;
 
     let search_radius = (8_u64 * 1024 * 1024 * 1024) / 5;
@@ -108,7 +181,7 @@ pub fn map_and_load_pe(
         anyhow::bail!("PE headers are outside the file");
     }
     unsafe {
-        std::ptr::copy_nonoverlapping(
+        ptr::copy_nonoverlapping(
             pe_bytes.as_ptr(),
             image_base as *mut u8,
             pe.size_of_headers(),
@@ -139,7 +212,7 @@ pub fn map_and_load_pe(
         let src = pe_bytes[raw_start..raw_end].as_ptr();
 
         unsafe {
-            std::ptr::copy_nonoverlapping(src, dest, copy_size);
+            ptr::copy_nonoverlapping(src, dest, copy_size);
         }
     }
 
@@ -218,7 +291,7 @@ pub fn map_and_load_pe(
     )?;
 
     // Prepare our own image for execution
-    execute_tls(image_base)?;
+    // execute_tls(image_base)?;
 
     // prepare our own image for execution
     // execute_dll_main(image_base)?;
@@ -226,7 +299,7 @@ pub fn map_and_load_pe(
     Ok((image_base as u64, section))
 }
 
-pub fn execute_dll_main(image_base: *const std::ffi::c_void) -> Result<()> {
+pub fn execute_dll_main(image_base: *const c_void) -> Result<()> {
     let mapped_pe = ParsedNtHeaders::parse(image_base as *const _)?;
 
     // grab the aop
@@ -238,21 +311,20 @@ pub fn execute_dll_main(image_base: *const std::ffi::c_void) -> Result<()> {
     unsafe {
         let dll_main_fptr = mapped_pe.va(entry_point_rva)?;
 
-        let dll_main: extern "system" fn(*mut u8, u32, *mut u8) =
-            std::mem::transmute(dll_main_fptr);
+        let dll_main: extern "system" fn(*mut u8, u32, *mut u8) = mem::transmute(dll_main_fptr);
 
         // call dll main with process attach
         dll_main(
             image_base as *mut u8,
             DLL_PROCESS_ATTACH,
-            std::ptr::null_mut(),
+            ptr::null_mut(),
         );
     };
 
     Ok(())
 }
 
-pub fn execute_tls(image_base: *const std::ffi::c_void) -> Result<()> {
+pub fn execute_tls(image_base: *const c_void) -> Result<()> {
     let mapped_pe = ParsedNtHeaders::parse(image_base as *const _)?;
 
     Ok(
@@ -280,11 +352,11 @@ pub fn execute_tls(image_base: *const std::ffi::c_void) -> Result<()> {
                         }
 
                         let callback_fn: extern "system" fn(*mut u8, u32, *mut u8) =
-                            unsafe { std::mem::transmute(callback as usize) };
+                            unsafe { mem::transmute(callback as usize) };
                         callback_fn(
                             image_base as *mut u8,
                             DLL_PROCESS_ATTACH,
-                            std::ptr::null_mut(),
+                            ptr::null_mut(),
                         );
                         callbacks_rva += mem::size_of::<u64>();
                     }
@@ -306,11 +378,11 @@ pub fn execute_tls(image_base: *const std::ffi::c_void) -> Result<()> {
                         }
 
                         let callback_fn: extern "system" fn(*mut u8, u32, *mut u8) =
-                            unsafe { std::mem::transmute(callback as usize) };
+                            unsafe { mem::transmute(callback as usize) };
                         callback_fn(
                             image_base as *mut u8,
                             DLL_PROCESS_ATTACH,
-                            std::ptr::null_mut(),
+                            ptr::null_mut(),
                         );
                         callbacks_rva += mem::size_of::<u32>();
                     }
@@ -321,7 +393,7 @@ pub fn execute_tls(image_base: *const std::ffi::c_void) -> Result<()> {
 }
 
 // This function will get or load all imported images of the specified PE file. It will not fix the imports itself.
-pub fn load_all_import_images(image_base: *const std::ffi::c_void) -> Result<()> {
+pub fn load_all_import_images(image_base: *const c_void) -> Result<()> {
     let nt_headers = ParsedNtHeaders::parse(image_base)?;
     let Some(import_descriptors) = nt_headers.import_descriptors()? else {
         return Ok(());
@@ -349,10 +421,7 @@ pub fn load_all_import_images(image_base: *const std::ffi::c_void) -> Result<()>
     Ok(())
 }
 
-pub fn custom_get_proc_address(
-    image_base: *const std::ffi::c_void,
-    symbol_name: &str,
-) -> Result<u64> {
+pub fn custom_get_proc_address(image_base: *const c_void, symbol_name: &str) -> Result<u64> {
     let nt_headers = ParsedNtHeaders::parse(image_base)?;
     let export_directory_entry = nt_headers
         .export_directory()
@@ -455,7 +524,7 @@ pub fn custom_get_proc_address(
     nt_headers.va(export_rva)
 }
 
-pub fn fix_import_table(image_base: *const std::ffi::c_void) -> Result<()> {
+pub fn fix_import_table(image_base: *const c_void) -> Result<()> {
     let nt_headers = ParsedNtHeaders::parse(image_base)?;
     let Some(import_descriptors) = nt_headers.import_descriptors()? else {
         return Ok(());

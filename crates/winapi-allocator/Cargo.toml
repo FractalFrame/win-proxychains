@@ -1,0 +1,13 @@
+[package]
+name = "winapi-allocator"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "winapi_allocator"
+path = "src/lib.rs"
+
+[dependencies.windows-sys]
+workspace = true
+features = ["Wdk_Storage_FileSystem"]

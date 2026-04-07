@@ -1,7 +1,8 @@
 // Copyright (c) 2026 FractalFrame <https://fractalframe.eu>
 // Part of the win-proxychains project. Licensed under BSL-1.1; see LICENCE.md.
 
-use std::{
+use alloc::vec::Vec;
+use core::{
     ffi::{CStr, c_void},
     fmt, mem,
 };
@@ -242,7 +243,7 @@ impl<'a> ParsedNtHeaders<'a> {
     }
 
     pub fn image_bytes(&self) -> &'a [u8] {
-        unsafe { std::slice::from_raw_parts(self.image_base(), self.size_of_image()) }
+        unsafe { core::slice::from_raw_parts(self.image_base(), self.size_of_image()) }
     }
 
     pub fn image_data_directory(&self, index: usize) -> Option<IMAGE_DATA_DIRECTORY> {
@@ -341,7 +342,7 @@ impl<'a> ParsedNtHeaders<'a> {
     pub fn read<T: Copy>(&self, rva: u32) -> Result<T> {
         let bytes = self.slice(rva, mem::size_of::<T>())?;
 
-        Ok(unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const T) })
+        Ok(unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const T) })
     }
 
     pub fn u32s(&self, rva: u32, count: usize) -> Result<Vec<u32>> {
@@ -437,14 +438,14 @@ impl<'a> ParsedNtHeaders<'a> {
         let patch_address = unsafe { self.image_base().add(offset) as *mut u8 };
         if self.is_64() {
             unsafe {
-                std::ptr::write_unaligned(patch_address as *mut u64, proc_address as u64);
+                core::ptr::write_unaligned(patch_address as *mut u64, proc_address as u64);
             }
         } else {
             let proc_address = u32::try_from(proc_address).map_err(|_| {
                 anyhow::anyhow!("resolved import address does not fit in u32: {proc_address:#x}")
             })?;
             unsafe {
-                std::ptr::write_unaligned(patch_address as *mut u32, proc_address);
+                core::ptr::write_unaligned(patch_address as *mut u32, proc_address);
             }
         }
 
@@ -475,17 +476,18 @@ fn read<T: Copy>(bytes: &[u8], offset: usize) -> Result<T> {
         .get(offset..end)
         .ok_or_else(|| anyhow::anyhow!("file offset out of bounds"))?;
 
-    Ok(unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const T) })
+    Ok(unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const T) })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
     use windows_sys::Win32::System::Diagnostics::Debug::IMAGE_SECTION_HEADER_0;
 
     fn write_struct<T: Copy>(bytes: &mut [u8], offset: usize, value: &T) {
         let size = mem::size_of::<T>();
-        let raw = unsafe { std::slice::from_raw_parts((value as *const T).cast::<u8>(), size) };
+        let raw = unsafe { core::slice::from_raw_parts((value as *const T).cast::<u8>(), size) };
         bytes[offset..offset + size].copy_from_slice(raw);
     }
 

@@ -1,15 +1,42 @@
-use anyhow::{Context, Result, anyhow, bail, ensure};
-use std::{
-    collections::hash_map::DefaultHasher,
+use alloc::{
+    borrow::ToOwned,
+    format,
+    string::{String, ToString},
+    vec::Vec,
+};
+use core::{
     fmt,
     hash::{Hash, Hasher},
+    mem,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6},
     str::FromStr,
-    time::{SystemTime, UNIX_EPOCH},
 };
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6,
 };
+use windows_sys::Win32::System::SystemInformation::GetTickCount64;
+
+struct SeedHasher(u64);
+
+impl Default for SeedHasher {
+    fn default() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+}
+
+impl Hasher for SeedHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(0x100_0000_01b3);
+        }
+    }
+}
 
 pub const SAMPLE_PROXYCHAINS_CONFIG: &str = r#"# win-proxychains.conf  
 #
@@ -469,7 +496,7 @@ unsafe fn sockaddr_to_socket_addr(
 ) -> Result<SocketAddr> {
     ensure!(!address.is_null(), "destination address pointer is null");
     ensure!(
-        address_len >= std::mem::size_of::<SOCKADDR>() as i32,
+        address_len >= mem::size_of::<SOCKADDR>() as i32,
         "destination address length {address_len} is too small for SOCKADDR"
     );
 
@@ -478,7 +505,7 @@ unsafe fn sockaddr_to_socket_addr(
     match family {
         AF_INET => {
             ensure!(
-                address_len >= std::mem::size_of::<SOCKADDR_IN>() as i32,
+                address_len >= mem::size_of::<SOCKADDR_IN>() as i32,
                 "destination address length {address_len} is too small for SOCKADDR_IN"
             );
             let address = unsafe { &*(address as *const SOCKADDR_IN) };
@@ -490,7 +517,7 @@ unsafe fn sockaddr_to_socket_addr(
         }
         AF_INET6 => {
             ensure!(
-                address_len >= std::mem::size_of::<SOCKADDR_IN6>() as i32,
+                address_len >= mem::size_of::<SOCKADDR_IN6>() as i32,
                 "destination address length {address_len} is too small for SOCKADDR_IN6"
             );
             let address = unsafe { &*(address as *const SOCKADDR_IN6) };
@@ -626,14 +653,10 @@ fn sample_random_chain(
         proxies.len()
     );
 
-    let mut seed_hasher = DefaultHasher::new();
+    let mut seed_hasher = SeedHasher::default();
     target.hash(&mut seed_hasher);
     proxies.len().hash(&mut seed_hasher);
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
-        .hash(&mut seed_hasher);
+    unsafe { GetTickCount64() }.hash(&mut seed_hasher);
     let mut seed = seed_hasher.finish();
 
     let requires_non_socks4_exit = target.is_ipv6();
@@ -814,7 +837,7 @@ fn ensure_no_arguments(line: &str, directive: &str) -> Result<()> {
 fn parse_single_value<T>(line: &str, directive: &str) -> Result<T>
 where
     T: FromStr,
-    T::Err: std::fmt::Display,
+    T::Err: fmt::Display,
 {
     let rest = line
         .strip_prefix(directive)
@@ -912,8 +935,15 @@ mod tests {
         ChainType, LocalnetRule, ProxyCredentials, ProxyEntry, ProxyType, ProxychainsConfig,
         SAMPLE_PROXYCHAINS_CONFIG,
     };
-    use std::mem::size_of;
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::{
+        borrow::ToOwned,
+        format,
+        mem::size_of,
+        net::{IpAddr, Ipv4Addr, Ipv6Addr},
+        string::ToString,
+        vec,
+        vec::Vec,
+    };
     use windows_sys::Win32::Networking::WinSock::{
         AF_INET, AF_INET6, IN_ADDR, IN_ADDR_0, IN_ADDR_0_0, IN6_ADDR, IN6_ADDR_0, SOCKADDR,
         SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_IN6_0,

@@ -1,13 +1,34 @@
 // Copyright (c) 2026 FractalFrame <https://fractalframe.eu>
 // Part of the win-proxychains project. Licensed under BSL-1.1; see LICENCE.md.
 
-use std::{
-    collections::HashMap,
+#![no_std]
+
+extern crate alloc;
+#[cfg(test)]
+extern crate std;
+#[cfg(feature = "std-bin")]
+extern crate std;
+
+use alloc::{
+    borrow::ToOwned,
+    boxed::Box,
+    collections::{BTreeMap, BTreeSet},
+    format,
+    string::{String, ToString},
+    vec::Vec,
+};
+use core::{
     ffi::c_void,
-    sync::{Mutex, atomic::AtomicU64},
+    mem,
+    net::IpAddr,
+    ptr,
+    slice,
+    str,
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
 use anyhow::Result;
+use winapi_allocator::WinApiAllocator;
 
 use windows_sys::Win32::{
     Foundation::GetLastError,
@@ -17,7 +38,11 @@ use windows_sys::Win32::{
     },
 };
 
-use crate::{hook::HookContext, map_pe::load_all_import_images};
+use crate::{
+    hook::HookContext,
+    map_pe::load_all_import_images,
+    sync::{Mutex, MutexGuard},
+};
 
 pub mod config;
 pub mod hook;
@@ -27,9 +52,21 @@ pub mod hooks_sockets;
 pub mod map_pe;
 pub mod socks;
 pub mod trace;
+pub mod sync;
+
+#[global_allocator]
+static GLOBAL_ALLOCATOR: WinApiAllocator<true> = WinApiAllocator::new();
+
+#[cfg(all(not(test), not(feature = "std-bin")))]
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
+}
 
 // stati
-static CONTEXT: AtomicU64 = AtomicU64::new(0);
+static CONTEXT: AtomicUsize = AtomicUsize::new(0);
 
 static FAILURE: u32 = 0;
 static SUCCESS: u32 = 1;
@@ -42,7 +79,7 @@ pub struct Context {
     pub section_base: u64,
 
     pub hooks: Vec<HookContext>,
-    pub socket_states: Mutex<HashMap<usize, SocketRuntimeState>>,
+    pub socket_states: Mutex<BTreeMap<usize, SocketRuntimeState>>,
 
     // The counter for the fake IPv4 addresses we return when proxy_dns is enabled. The config's `remote_dns_subnet`
     // seeds the top octet.
@@ -57,9 +94,11 @@ pub struct Context {
     // This matches proxychains-ng's behavior.
     // Each "lookup" will generate two mappings. One for Ipv4 and one for Ipv6.
     // Afer 0xffffff requests, IPv4 will be dropped from that point on, only IPv6 will be generated.
-    pub dns_cache: Mutex<HashMap<String, Vec<std::net::IpAddr>>>,
-    pub reverse_dns_cache: Mutex<HashMap<std::net::IpAddr, String>>,
-    pub dns_hostent_storage: Mutex<HashMap<u32, Box<hooks_dns::FakeHostentStorage>>>,
+    pub dns_cache: Mutex<BTreeMap<String, Vec<IpAddr>>>,
+    pub reverse_dns_cache: Mutex<BTreeMap<IpAddr, String>>,
+    pub dns_hostent_storage: Mutex<BTreeMap<u32, Box<hooks_dns::FakeHostentStorage>>>,
+    pub owned_addrinfo_a_roots: BTreeSet<usize>,
+    pub owned_addrinfow_roots: BTreeSet<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,47 +146,60 @@ pub struct SocketRuntimeState {
     pub async_select: Option<AsyncSelectState>,
 }
 
-pub fn get_context() -> &'static mut Context {
+pub fn get_context() -> *mut Mutex<Context> {
+    let context_ptr = CONTEXT.load(Ordering::SeqCst) as *mut Mutex<Context>;
+    if context_ptr.is_null() {
+        let new_context = Box::new(Mutex::new(Context {
+            last_error: String::new(),
+            config: None,
+            section_name: String::new(),
+            section_base: 0,
+            hooks: Vec::new(),
+            socket_states: Mutex::new(BTreeMap::new()),
+            ipv4_fake_counter: 0,
+            ipv6_fake_counter: 0,
+            dns_cache: Mutex::new(BTreeMap::new()),
+            reverse_dns_cache: Mutex::new(BTreeMap::new()),
+            dns_hostent_storage: Mutex::new(BTreeMap::new()),
+            owned_addrinfo_a_roots: BTreeSet::new(),
+            owned_addrinfow_roots: BTreeSet::new(),
+        }));
+        let new_context_ptr = Box::into_raw(new_context);
+
+        CONTEXT.store(new_context_ptr as usize, Ordering::SeqCst);
+
+        new_context_ptr
+    } else {
+        context_ptr
+    }
+}
+
+pub fn lock_context() -> MutexGuard<'static, Context> {
     unsafe {
-        let context_ptr = CONTEXT.load(std::sync::atomic::Ordering::SeqCst) as *mut Context;
-        if context_ptr.is_null() {
-            let new_context = Box::new(Context {
-                last_error: String::new(),
-                config: None,
-                section_name: String::new(),
-                section_base: 0,
-                hooks: Vec::new(),
-                socket_states: Mutex::new(HashMap::new()),
-                ipv4_fake_counter: 0,
-                ipv6_fake_counter: 0,
-                dns_cache: Mutex::new(HashMap::new()),
-                reverse_dns_cache: Mutex::new(HashMap::new()),
-                dns_hostent_storage: Mutex::new(HashMap::new()),
-            });
-            let new_context_ptr = Box::into_raw(new_context);
-
-            CONTEXT.store(new_context_ptr as u64, std::sync::atomic::Ordering::SeqCst);
-
-            &mut *new_context_ptr
-        } else {
-            &mut *context_ptr
-        }
+        (*get_context())
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
 pub fn release_context() {
     unsafe {
-        let context_ptr = CONTEXT.load(std::sync::atomic::Ordering::SeqCst) as *mut Context;
+        let context_ptr = CONTEXT.load(Ordering::SeqCst) as *mut Mutex<Context>;
         if !context_ptr.is_null() {
             let _ = Box::from_raw(context_ptr);
-            CONTEXT.store(0, std::sync::atomic::Ordering::SeqCst);
+            CONTEXT.store(0, Ordering::SeqCst);
         }
     }
 }
 
 pub fn set_last_error(message: String) {
     emit_debug_last_error(&message);
-    let context = get_context();
+    let mut context = lock_context();
+    context.last_error = message;
+}
+
+pub fn set_last_error_in_context(context: &mut Context, message: String) {
+    emit_debug_last_error(&message);
     context.last_error = message;
 }
 
@@ -155,7 +207,7 @@ pub fn set_last_error(message: String) {
 fn emit_debug_last_error(message: &str) {
     let wide_message: Vec<u16> = format!("win-proxychains: {message}")
         .encode_utf16()
-        .chain(std::iter::once(0))
+        .chain([0])
         .collect();
     unsafe {
         windows_sys::Win32::System::Diagnostics::Debug::OutputDebugStringW(wide_message.as_ptr());
@@ -165,7 +217,7 @@ fn emit_debug_last_error(message: &str) {
 #[cfg(not(debug_assertions))]
 fn emit_debug_last_error(_message: &str) {}
 
-pub fn bail_with_last_error<T>(message: impl std::fmt::Display) -> Result<T> {
+pub fn bail_with_last_error<T>(message: impl core::fmt::Display) -> Result<T> {
     let error_code = unsafe { GetLastError() };
     let full_message = format!("{message}: Windows API error {error_code}");
     set_last_error(full_message.clone());
@@ -174,36 +226,26 @@ pub fn bail_with_last_error<T>(message: impl std::fmt::Display) -> Result<T> {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_last_error_size() -> usize {
-    let context = get_context();
+    let context = lock_context();
     let message = &context.last_error;
     message.as_bytes().len()
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_last_error_message(buffer: *mut u8, buffer_len: usize) -> usize {
-    let context = get_context();
+    let context = lock_context();
     let message = &context.last_error;
     let bytes = message.as_bytes();
     let copy_len = bytes.len().min(buffer_len);
 
     if !buffer.is_null() && copy_len > 0 {
         unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer, copy_len);
+            ptr::copy_nonoverlapping(bytes.as_ptr(), buffer, copy_len);
         }
     }
 
     copy_len
 }
-
-// #[unsafe(no_mangle)]
-// pub unsafe extern "C" fn get_last_error_message_remote(buffer: *mut u8) {
-
-// }
-
-// pub fn read_last_error_message_remote(process: &Process) -> Result<String> {
-//     // first allocate a buffer remote
-
-// }
 
 fn find_own_header() -> Result<*const c_void> {
     // Get the address of a function in our own module (e.g., this function)
@@ -268,14 +310,14 @@ impl InitializePacket {
     pub fn new(config: &str, section: &str, section_base: u64) -> Result<Self> {
         let config_bytes = config.as_bytes();
         let section_bytes = section.as_bytes();
-        let mut packet: InitializePacket = unsafe { std::mem::zeroed() };
+        let mut packet: InitializePacket = unsafe { mem::zeroed() };
         packet.config_len = config_bytes.len();
         packet.section_name_len = section_bytes.len();
         packet.section_base = section_base;
 
         if !config.is_empty() && config_bytes.len() <= packet.config_slice.len() {
             unsafe {
-                std::ptr::copy_nonoverlapping(
+                ptr::copy_nonoverlapping(
                     config_bytes.as_ptr(),
                     packet.config_slice.as_mut_ptr(),
                     config_bytes.len(),
@@ -289,7 +331,7 @@ impl InitializePacket {
 
         if !section.is_empty() && section_bytes.len() <= packet.section_name_slice.len() {
             unsafe {
-                std::ptr::copy_nonoverlapping(
+                ptr::copy_nonoverlapping(
                     section_bytes.as_ptr(),
                     packet.section_name_slice.as_mut_ptr(),
                     section_bytes.len(),
@@ -313,7 +355,7 @@ impl InitializePacket {
 
         self.og_entry = og_entry;
         unsafe {
-            std::ptr::copy_nonoverlapping(
+            ptr::copy_nonoverlapping(
                 og_bytes.as_ptr(),
                 self.og_bytes.as_mut_ptr(),
                 og_bytes.len(),
@@ -325,9 +367,9 @@ impl InitializePacket {
 
     pub fn as_bytes(&self) -> &[u8] {
         unsafe {
-            std::slice::from_raw_parts(
+            slice::from_raw_parts(
                 (self as *const InitializePacket) as *const u8,
-                std::mem::size_of::<InitializePacket>(),
+                mem::size_of::<InitializePacket>(),
             )
         }
     }
@@ -335,6 +377,7 @@ impl InitializePacket {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn initialize_remote(packet: *const InitializePacket) -> u32 {
+   
     // First we need to initialize our allocators
     let Ok(local_pe) = find_own_header() else {
         // can't set errors yet.
@@ -352,10 +395,10 @@ pub unsafe extern "C" fn initialize_remote(packet: *const InitializePacket) -> u
     }
 
     // first execute tls
-    if map_pe::execute_tls(local_pe as *const _).is_err() {
-        // can't set errors yet.
-        return FAILURE;
-    }
+    // if map_pe::execute_tls(local_pe as *const _).is_err() {
+    //     // can't set errors yet.
+    //     return FAILURE;
+    // }
 
     // From here on out we've got allocators and memory working.
     if packet.is_null() {
@@ -409,7 +452,7 @@ pub unsafe extern "C" fn initialize_remote(packet: *const InitializePacket) -> u
             }
 
             // write original bytes back
-            std::ptr::copy_nonoverlapping(
+            ptr::copy_nonoverlapping(
                 packet.og_bytes.as_ptr(),
                 packet.og_entry as *mut u8,
                 packet.og_bytes.len(),
@@ -433,7 +476,7 @@ pub unsafe extern "C" fn initialize_remote(packet: *const InitializePacket) -> u
         }
 
         // jump to it
-        let entry_fn: extern "C" fn() = unsafe { std::mem::transmute(packet.og_entry) };
+        let entry_fn: extern "C" fn() = unsafe { mem::transmute(packet.og_entry) };
         entry_fn();
     }
 
@@ -449,14 +492,14 @@ unsafe fn initialize(
 ) -> u32 {
     // Check all pointers are not null at least for early-sanity check
     if config.is_null() && config_len != 0 {
-        let context = get_context();
+        let mut context = lock_context();
         context.config = None;
         context.last_error = "initialize received a null config pointer".to_owned();
         return FAILURE;
     }
 
     if section_name.is_null() && section_name_len != 0 {
-        let context = get_context();
+        let mut context = lock_context();
         context.section_name.clear();
         context.last_error = "initialize received a null section name pointer".to_owned();
         return FAILURE;
@@ -471,29 +514,29 @@ unsafe fn initialize(
     // We could further restrict our imports and build fully self-importing
     // But that's a chore
     if load_all_import_images(own_header as *const _).is_err() {
-        let context = get_context();
+        let mut context = lock_context();
         context.config = None;
         context.last_error = "Failed to load import images".to_owned();
         return FAILURE;
     };
 
-    let config_slice = unsafe { std::slice::from_raw_parts(config, config_len) };
-    match std::str::from_utf8(config_slice) {
+    let config_slice = unsafe { slice::from_raw_parts(config, config_len) };
+    match str::from_utf8(config_slice) {
         Ok(config_str) => match config::ProxychainsConfig::parse(config_str) {
             Ok(parsed_config) => {
-                let context = get_context();
+                let mut context = lock_context();
                 context.last_error.clear();
                 context.config = Some(parsed_config);
             }
             Err(error) => {
-                let context = get_context();
+                let mut context = lock_context();
                 context.config = None;
                 context.last_error = format!("Invalid proxychains configuration: {error:#}");
                 return FAILURE;
             }
         },
         Err(error) => {
-            let context = get_context();
+            let mut context = lock_context();
             context.config = None;
             context.last_error = format!("Invalid UTF-8 configuration: {error}");
             return FAILURE;
@@ -501,9 +544,9 @@ unsafe fn initialize(
     }
 
     // now set our section data
-    let context = get_context();
-    let section_name_slice = unsafe { std::slice::from_raw_parts(section_name, section_name_len) };
-    match std::str::from_utf8(section_name_slice) {
+    let mut context = lock_context();
+    let section_name_slice = unsafe { slice::from_raw_parts(section_name, section_name_len) };
+    match str::from_utf8(section_name_slice) {
         Ok(section_name_str) => {
             context.section_name = section_name_str.to_owned();
         }
@@ -521,6 +564,7 @@ unsafe fn initialize(
         .as_ref()
         .map(|c| c.proxy_dns)
         .unwrap_or(false);
+    drop(context);
 
     // Our context is set
     // Now hook the local functions we need to
@@ -530,18 +574,20 @@ unsafe fn initialize(
         "NtCreateUserProcess",
         hooks_ntdll::hooked_NtCreateUserProcess as u64,
     ) else {
-        let context = get_context();
+        let mut context = lock_context();
         context.last_error = "Failed to create hook for NtCreateUserProcess".to_owned();
         return FAILURE;
     };
 
     if let Err(e) = create_user_process_hook.hook() {
-        let context = get_context();
+        let mut context = lock_context();
         context.last_error = format!("Failed to hook NtCreateUserProcess: {e:#}");
         return FAILURE;
     }
 
+    let mut context = lock_context();
     context.hooks.push(create_user_process_hook);
+    drop(context);
 
     if proxy_dns {
         let Ok(mut gethostbyname_hook) = HookContext::new(
@@ -549,123 +595,143 @@ unsafe fn initialize(
             "gethostbyname",
             hooks_dns::hooked_gethostbyname as u64,
         ) else {
-            let context = get_context();
+            let mut context = lock_context();
             context.last_error = "Failed to create hook for gethostbyname".to_owned();
             return FAILURE;
         };
 
         if let Err(e) = gethostbyname_hook.hook() {
-            let context = get_context();
+            let mut context = lock_context();
             context.last_error = format!("Failed to hook gethostbyname: {e:#}");
             return FAILURE;
         }
 
+        let mut context = lock_context();
         context.hooks.push(gethostbyname_hook);
+        drop(context);
 
         let Ok(mut wsa_async_get_host_by_name_hook) = HookContext::new(
             "ws2_32.dll",
             "WSAAsyncGetHostByName",
             hooks_dns::hooked_WSAAsyncGetHostByName as u64,
         ) else {
-            let context = get_context();
+            let mut context = lock_context();
             context.last_error = "Failed to create hook for WSAAsyncGetHostByName".to_owned();
             return FAILURE;
         };
 
         if let Err(e) = wsa_async_get_host_by_name_hook.hook() {
-            let context = get_context();
+            let mut context = lock_context();
             context.last_error = format!("Failed to hook WSAAsyncGetHostByName: {e:#}");
             return FAILURE;
         }
 
+        let mut context = lock_context();
         context.hooks.push(wsa_async_get_host_by_name_hook);
+        drop(context);
 
         let Ok(mut getaddrinfo_hook) = HookContext::new(
             "ws2_32.dll",
             "getaddrinfo",
             hooks_dns::hooked_getaddrinfo as u64,
         ) else {
-            let context = get_context();
+            let mut context = lock_context();
             context.last_error = "Failed to create hook for getaddrinfo".to_owned();
             return FAILURE;
         };
 
         if let Err(e) = getaddrinfo_hook.hook() {
-            let context = get_context();
+            let mut context = lock_context();
             context.last_error = format!("Failed to hook getaddrinfo: {e:#}");
             return FAILURE;
         }
 
+        let mut context = lock_context();
         context.hooks.push(getaddrinfo_hook);
+        drop(context);
 
         let Ok(mut freeaddrinfo_hook) = HookContext::new(
             "ws2_32.dll",
             "freeaddrinfo",
             hooks_dns::hooked_freeaddrinfo as u64,
         ) else {
-            let context = get_context();
+            let mut context = lock_context();
             context.last_error = "Failed to create hook for freeaddrinfo".to_owned();
             return FAILURE;
         };
 
         if let Err(e) = freeaddrinfo_hook.hook() {
-            let context = get_context();
+            let mut context = lock_context();
             context.last_error = format!("Failed to hook freeaddrinfo: {e:#}");
             return FAILURE;
         }
 
+        let mut context = lock_context();
         context.hooks.push(freeaddrinfo_hook);
+        drop(context);
 
         let Ok(mut get_addr_info_w_hook) = HookContext::new(
             "ws2_32.dll",
             "GetAddrInfoW",
             hooks_dns::hooked_GetAddrInfoW as u64,
         ) else {
-            let context = get_context();
+            let mut context = lock_context();
             context.last_error = "Failed to create hook for GetAddrInfoW".to_owned();
             return FAILURE;
         };
 
         if let Err(e) = get_addr_info_w_hook.hook() {
-            let context = get_context();
+            let mut context = lock_context();
             context.last_error = format!("Failed to hook GetAddrInfoW: {e:#}");
             return FAILURE;
         }
 
+        let mut context = lock_context();
         context.hooks.push(get_addr_info_w_hook);
+        drop(context);
 
         let Ok(mut free_addr_info_w_hook) = HookContext::new(
             "ws2_32.dll",
             "FreeAddrInfoW",
             hooks_dns::hooked_FreeAddrInfoW as u64,
         ) else {
-            let context = get_context();
+            let mut context = lock_context();
             context.last_error = "Failed to create hook for FreeAddrInfoW".to_owned();
             return FAILURE;
         };
 
-        if let Some(existing_hook) = context.hooks.iter().find(|existing_hook| {
-            existing_hook
-                .module
-                .eq_ignore_ascii_case(&free_addr_info_w_hook.module)
-                && existing_hook.h_proc == free_addr_info_w_hook.h_proc
-        }) {
-            hooks_dns::seed_free_addr_info_w_trampoline(existing_hook.trampoline());
+        let existing_trampoline = {
+            let context = lock_context();
+            context.hooks.iter().find_map(|existing_hook| {
+                if existing_hook
+                    .module
+                    .eq_ignore_ascii_case(&free_addr_info_w_hook.module)
+                    && existing_hook.h_proc == free_addr_info_w_hook.h_proc
+                {
+                    Some(existing_hook.trampoline())
+                } else {
+                    None
+                }
+            })
+        };
+
+        if let Some(existing_trampoline) = existing_trampoline {
+            //hooks_dns::seed_free_addr_info_w_trampoline(existing_trampoline);
             trace::log(format!(
-                "Skipping duplicate hook for {}!{} at {:#x}; reusing trampoline {:#x} from {}",
+                "Skipping duplicate hook for {}!{} at {:#x}; reusing trampoline {:#x}",
                 free_addr_info_w_hook.module,
                 free_addr_info_w_hook.function,
                 free_addr_info_w_hook.h_proc,
-                existing_hook.trampoline(),
-                existing_hook.function
+                existing_trampoline
             ));
         } else {
             if let Err(e) = free_addr_info_w_hook.hook() {
-                let context = get_context();
+                let mut context = lock_context();
                 context.last_error = format!("Failed to hook FreeAddrInfoW: {e:#}");
                 return FAILURE;
             }
 
+            let mut context = lock_context();
             context.hooks.push(free_addr_info_w_hook);
         }
     }
@@ -676,179 +742,198 @@ unsafe fn initialize(
         "connect",
         hooks_sockets::hooked_connect as u64,
     ) else {
-        let context = get_context();
+        let mut context = lock_context();
         context.last_error = "Failed to create hook for connect".to_owned();
         return FAILURE;
     };
 
     if let Err(e) = connect_hook.hook() {
-        let context = get_context();
+        let mut context = lock_context();
         context.last_error = format!("Failed to hook connect: {e:#}");
         return FAILURE;
     }
 
+    let mut context = lock_context();
     context.hooks.push(connect_hook);
+    drop(context);
 
     let Ok(mut wsa_connect_hook) = HookContext::new(
         "ws2_32.dll",
         "WSAConnect",
         hooks_sockets::hooked_WSAConnect as u64,
     ) else {
-        let context = get_context();
+        let mut context = lock_context();
         context.last_error = "Failed to create hook for WSAConnect".to_owned();
         return FAILURE;
     };
 
     if let Err(e) = wsa_connect_hook.hook() {
-        let context = get_context();
+        let mut context = lock_context();
         context.last_error = format!("Failed to hook WSAConnect: {e:#}");
         return FAILURE;
     }
 
+    let mut context = lock_context();
     context.hooks.push(wsa_connect_hook);
+    drop(context);
 
     let Ok(mut ioctlsocket_hook) = HookContext::new(
         "ws2_32.dll",
         "ioctlsocket",
         hooks_sockets::hooked_ioctlsocket as u64,
     ) else {
-        let context = get_context();
+        let mut context = lock_context();
         context.last_error = "Failed to create hook for ioctlsocket".to_owned();
         return FAILURE;
     };
 
     if let Err(e) = ioctlsocket_hook.hook() {
-        let context = get_context();
+        let mut context = lock_context();
         context.last_error = format!("Failed to hook ioctlsocket: {e:#}");
         return FAILURE;
     }
 
+    let mut context = lock_context();
     context.hooks.push(ioctlsocket_hook);
+    drop(context);
 
     let Ok(mut wsa_event_select_hook) = HookContext::new(
         "ws2_32.dll",
         "WSAEventSelect",
         hooks_sockets::hooked_WSAEventSelect as u64,
     ) else {
-        let context = get_context();
+        let mut context = lock_context();
         context.last_error = "Failed to create hook for WSAEventSelect".to_owned();
         return FAILURE;
     };
 
     if let Err(e) = wsa_event_select_hook.hook() {
-        let context = get_context();
+        let mut context = lock_context();
         context.last_error = format!("Failed to hook WSAEventSelect: {e:#}");
         return FAILURE;
     }
 
+    let mut context = lock_context();
     context.hooks.push(wsa_event_select_hook);
+    drop(context);
 
     let Ok(mut wsa_async_select_hook) = HookContext::new(
         "ws2_32.dll",
         "WSAAsyncSelect",
         hooks_sockets::hooked_WSAAsyncSelect as u64,
     ) else {
-        let context = get_context();
+        let mut context = lock_context();
         context.last_error = "Failed to create hook for WSAAsyncSelect".to_owned();
         return FAILURE;
     };
 
     if let Err(e) = wsa_async_select_hook.hook() {
-        let context = get_context();
+        let mut context = lock_context();
         context.last_error = format!("Failed to hook WSAAsyncSelect: {e:#}");
         return FAILURE;
     }
 
+    let mut context = lock_context();
     context.hooks.push(wsa_async_select_hook);
+    drop(context);
 
     let Ok(mut wsa_ioctl_hook) = HookContext::new(
         "ws2_32.dll",
         "WSAIoctl",
         hooks_sockets::hooked_WSAIoctl as u64,
     ) else {
-        let context = get_context();
+        let mut context = lock_context();
         context.last_error = "Failed to create hook for WSAIoctl".to_owned();
         return FAILURE;
     };
 
     if let Err(e) = wsa_ioctl_hook.hook() {
-        let context = get_context();
+        let mut context = lock_context();
         context.last_error = format!("Failed to hook WSAIoctl: {e:#}");
         return FAILURE;
     }
 
+    let mut context = lock_context();
     context.hooks.push(wsa_ioctl_hook);
+    drop(context);
 
     let Ok(mut create_iocp_hook) = HookContext::new(
         "kernelbase.dll",
         "CreateIoCompletionPort",
         hooks_sockets::hooked_CreateIoCompletionPort as u64,
     ) else {
-        let context = get_context();
+        let mut context = lock_context();
         context.last_error = "Failed to create hook for CreateIoCompletionPort".to_owned();
         return FAILURE;
     };
 
     if let Err(e) = create_iocp_hook.hook() {
-        let context = get_context();
+        let mut context = lock_context();
         context.last_error = format!("Failed to hook CreateIoCompletionPort: {e:#}");
         return FAILURE;
     }
 
+    let mut context = lock_context();
     context.hooks.push(create_iocp_hook);
+    drop(context);
 
     let Ok(mut setsockopt_hook) = HookContext::new(
         "ws2_32.dll",
         "setsockopt",
         hooks_sockets::hooked_setsockopt as u64,
     ) else {
-        let context = get_context();
+        let mut context = lock_context();
         context.last_error = "Failed to create hook for setsockopt".to_owned();
         return FAILURE;
     };
 
     if let Err(e) = setsockopt_hook.hook() {
-        let context = get_context();
+        let mut context = lock_context();
         context.last_error = format!("Failed to hook setsockopt: {e:#}");
         return FAILURE;
     }
 
+    let mut context = lock_context();
     context.hooks.push(setsockopt_hook);
+    drop(context);
 
     let Ok(mut wsa_get_overlapped_result_hook) = HookContext::new(
         "ws2_32.dll",
         "WSAGetOverlappedResult",
         hooks_sockets::hooked_WSAGetOverlappedResult as u64,
     ) else {
-        let context = get_context();
+        let mut context = lock_context();
         context.last_error = "Failed to create hook for WSAGetOverlappedResult".to_owned();
         return FAILURE;
     };
 
     if let Err(e) = wsa_get_overlapped_result_hook.hook() {
-        let context = get_context();
+        let mut context = lock_context();
         context.last_error = format!("Failed to hook WSAGetOverlappedResult: {e:#}");
         return FAILURE;
     }
 
+    let mut context = lock_context();
     context.hooks.push(wsa_get_overlapped_result_hook);
+    drop(context);
 
     let Ok(mut closesocket_hook) = HookContext::new(
         "ws2_32.dll",
         "closesocket",
         hooks_sockets::hooked_closesocket as u64,
     ) else {
-        let context = get_context();
+        let mut context = lock_context();
         context.last_error = "Failed to create hook for closesocket".to_owned();
         return FAILURE;
     };
 
     if let Err(e) = closesocket_hook.hook() {
-        let context = get_context();
+        let mut context = lock_context();
         context.last_error = format!("Failed to hook closesocket: {e:#}");
         return FAILURE;
     }
 
+    let mut context = lock_context();
     context.hooks.push(closesocket_hook);
 
     SUCCESS

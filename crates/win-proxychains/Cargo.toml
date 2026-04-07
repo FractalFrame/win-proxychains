@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+std-bin = []
+
 [lib]
 name = "win_proxychains_dll"
 path = "src/lib.rs"
@@ -12,26 +16,31 @@ crate-type = ["cdylib", "rlib"]
 [[bin]]
 name = "win-proxychains"
 path = "src/bin/main.rs"
+required-features = ["std-bin"]
 
 [[bin]]
 name = "win-proxychains-test-target"
 path = "src/bin/win_proxychains_test_target.rs"
+required-features = ["std-bin"]
 
 [dependencies]
 clap.workspace = true
-iced-x86.workspace = true
+iced-x86 = { version = "1.21.0", default-features = false, features = ["decoder", "encoder", "block_encoder", "op_code_info", "instr_info", "gas", "intel", "masm", "nasm", "fast_fmt", "no_std"] }
 magpie-process.workspace = true
-anyhow.workspace = true
+winapi-allocator.workspace = true
+anyhow = { version = "*", default-features = false }
 
 [dependencies.windows-sys]
 workspace = true
 features = [
     "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
     "Wdk_System_Memory",
     "Wdk_System_SystemServices",
     "Win32_Foundation",
     "Win32_Networking_WinSock",
     "Win32_Security",
+    "Win32_Storage_FileSystem",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Diagnostics_ToolHelp",
   "Win32_System_Kernel",
