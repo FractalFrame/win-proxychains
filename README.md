@@ -36,7 +36,12 @@ To build `win-proxychains` you need at least:
 You can use the following command in the root of the repository to build:
 
 ```
-cargo build --release
+build.bat
+```
+_or_
+```
+cargo build --release -p win-proxychains --features std-bin --bin win-proxychains
+cargo build --release -p win-proxychains --lib
 ```
 
 ## Features
