@@ -19,7 +19,10 @@ use win_proxychains_dll::{
 };
 use windows_sys::Win32::{
     Foundation::LocalFree,
-    System::LibraryLoader::{GetModuleHandleA, LoadLibraryA},
+    System::{
+        Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT, SetConsoleCtrlHandler},
+        LibraryLoader::{GetModuleHandleA, LoadLibraryA},
+    },
     UI::Shell::CommandLineToArgvW,
 };
 
@@ -135,12 +138,42 @@ fn run_proxychains_mode(cli: &Cli) -> Result<i32> {
         .program
         .as_ref()
         .context("proxychains mode requires a program to launch")?;
+    let _console_ctrl_guard = ConsoleCtrlGuard::install()?;
     let status = std::process::Command::new(program)
         .args(&cli.args)
         .status()
         .with_context(|| format!("failed to launch {}", program.to_string_lossy()))?;
 
     Ok(status.code().unwrap_or(1))
+}
+
+struct ConsoleCtrlGuard;
+
+impl ConsoleCtrlGuard {
+    fn install() -> Result<Self> {
+        let result = unsafe { SetConsoleCtrlHandler(Some(ignore_child_console_ctrl), 1) };
+        if result == 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to install console control handler before launching child");
+        }
+
+        Ok(Self)
+    }
+}
+
+impl Drop for ConsoleCtrlGuard {
+    fn drop(&mut self) {
+        unsafe {
+            SetConsoleCtrlHandler(Some(ignore_child_console_ctrl), 0);
+        }
+    }
+}
+
+unsafe extern "system" fn ignore_child_console_ctrl(ctrl_type: u32) -> i32 {
+    match ctrl_type {
+        CTRL_C_EVENT | CTRL_BREAK_EVENT => 1,
+        _ => 0,
+    }
 }
 
 fn current_exe_path() -> Result<PathBuf> {
@@ -609,8 +642,8 @@ fn load_pe_in_current_process(path: &Path) -> Result<(u64, MemorySection)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CONFIG_ENV_VAR, Cli, Mode, resolve_config_path, resolve_proxychains_dll_path,
-        write_sample_config,
+        CONFIG_ENV_VAR, CTRL_BREAK_EVENT, CTRL_C_EVENT, Cli, Mode, ignore_child_console_ctrl,
+        resolve_config_path, resolve_proxychains_dll_path, write_sample_config,
     };
     use std::{
         ffi::OsString,
@@ -621,6 +654,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
     use win_proxychains_dll::config::SAMPLE_PROXYCHAINS_CONFIG;
+    use windows_sys::Win32::System::Console::CTRL_CLOSE_EVENT;
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -666,6 +700,13 @@ mod tests {
             ]
         );
         assert!(!cli.debug.dump_cli);
+    }
+
+    #[test]
+    fn console_ctrl_handler_only_keeps_wrapper_alive_for_interrupts() {
+        assert_eq!(unsafe { ignore_child_console_ctrl(CTRL_C_EVENT) }, 1);
+        assert_eq!(unsafe { ignore_child_console_ctrl(CTRL_BREAK_EVENT) }, 1);
+        assert_eq!(unsafe { ignore_child_console_ctrl(CTRL_CLOSE_EVENT) }, 0);
     }
 
     #[test]
