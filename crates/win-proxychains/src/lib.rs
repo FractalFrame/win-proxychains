@@ -21,9 +21,7 @@ use core::{
     ffi::c_void,
     mem,
     net::IpAddr,
-    ptr,
-    slice,
-    str,
+    ptr, slice, str,
     sync::atomic::{AtomicUsize, Ordering},
 };
 
@@ -51,8 +49,8 @@ pub mod hooks_ntdll;
 pub mod hooks_sockets;
 pub mod map_pe;
 pub mod socks;
-pub mod trace;
 pub mod sync;
+pub mod trace;
 
 #[global_allocator]
 static GLOBAL_ALLOCATOR: WinApiAllocator<true> = WinApiAllocator::new();
@@ -375,9 +373,27 @@ impl InitializePacket {
     }
 }
 
+fn install_hook(module: &str, function: &str, target: u64) -> u32 {
+    let Ok(mut hook) = HookContext::new(module, function, target) else {
+        let mut context = lock_context();
+        context.last_error = format!("Failed to create hook for {function}");
+        return FAILURE;
+    };
+
+    if let Err(e) = hook.hook() {
+        let mut context = lock_context();
+        context.last_error = format!("Failed to hook {function}: {e:#}");
+        return FAILURE;
+    }
+
+    let mut context = lock_context();
+    context.hooks.push(hook);
+
+    SUCCESS
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn initialize_remote(packet: *const InitializePacket) -> u32 {
-   
     // First we need to initialize our allocators
     let Ok(local_pe) = find_own_header() else {
         // can't set errors yet.
@@ -569,126 +585,60 @@ unsafe fn initialize(
     // Our context is set
     // Now hook the local functions we need to
 
-    let Ok(mut create_user_process_hook) = HookContext::new(
+    if install_hook(
         "ntdll.dll",
         "NtCreateUserProcess",
         hooks_ntdll::hooked_NtCreateUserProcess as u64,
-    ) else {
-        let mut context = lock_context();
-        context.last_error = "Failed to create hook for NtCreateUserProcess".to_owned();
-        return FAILURE;
-    };
-
-    if let Err(e) = create_user_process_hook.hook() {
-        let mut context = lock_context();
-        context.last_error = format!("Failed to hook NtCreateUserProcess: {e:#}");
+    ) != SUCCESS
+    {
         return FAILURE;
     }
 
-    let mut context = lock_context();
-    context.hooks.push(create_user_process_hook);
-    drop(context);
-
     if proxy_dns {
-        let Ok(mut gethostbyname_hook) = HookContext::new(
+        if install_hook(
             "ws2_32.dll",
             "gethostbyname",
             hooks_dns::hooked_gethostbyname as u64,
-        ) else {
-            let mut context = lock_context();
-            context.last_error = "Failed to create hook for gethostbyname".to_owned();
-            return FAILURE;
-        };
-
-        if let Err(e) = gethostbyname_hook.hook() {
-            let mut context = lock_context();
-            context.last_error = format!("Failed to hook gethostbyname: {e:#}");
+        ) != SUCCESS
+        {
             return FAILURE;
         }
 
-        let mut context = lock_context();
-        context.hooks.push(gethostbyname_hook);
-        drop(context);
-
-        let Ok(mut wsa_async_get_host_by_name_hook) = HookContext::new(
+        if install_hook(
             "ws2_32.dll",
             "WSAAsyncGetHostByName",
             hooks_dns::hooked_WSAAsyncGetHostByName as u64,
-        ) else {
-            let mut context = lock_context();
-            context.last_error = "Failed to create hook for WSAAsyncGetHostByName".to_owned();
-            return FAILURE;
-        };
-
-        if let Err(e) = wsa_async_get_host_by_name_hook.hook() {
-            let mut context = lock_context();
-            context.last_error = format!("Failed to hook WSAAsyncGetHostByName: {e:#}");
+        ) != SUCCESS
+        {
             return FAILURE;
         }
 
-        let mut context = lock_context();
-        context.hooks.push(wsa_async_get_host_by_name_hook);
-        drop(context);
-
-        let Ok(mut getaddrinfo_hook) = HookContext::new(
+        if install_hook(
             "ws2_32.dll",
             "getaddrinfo",
             hooks_dns::hooked_getaddrinfo as u64,
-        ) else {
-            let mut context = lock_context();
-            context.last_error = "Failed to create hook for getaddrinfo".to_owned();
-            return FAILURE;
-        };
-
-        if let Err(e) = getaddrinfo_hook.hook() {
-            let mut context = lock_context();
-            context.last_error = format!("Failed to hook getaddrinfo: {e:#}");
+        ) != SUCCESS
+        {
             return FAILURE;
         }
 
-        let mut context = lock_context();
-        context.hooks.push(getaddrinfo_hook);
-        drop(context);
-
-        let Ok(mut freeaddrinfo_hook) = HookContext::new(
+        if install_hook(
             "ws2_32.dll",
             "freeaddrinfo",
             hooks_dns::hooked_freeaddrinfo as u64,
-        ) else {
-            let mut context = lock_context();
-            context.last_error = "Failed to create hook for freeaddrinfo".to_owned();
-            return FAILURE;
-        };
-
-        if let Err(e) = freeaddrinfo_hook.hook() {
-            let mut context = lock_context();
-            context.last_error = format!("Failed to hook freeaddrinfo: {e:#}");
+        ) != SUCCESS
+        {
             return FAILURE;
         }
 
-        let mut context = lock_context();
-        context.hooks.push(freeaddrinfo_hook);
-        drop(context);
-
-        let Ok(mut get_addr_info_w_hook) = HookContext::new(
+        if install_hook(
             "ws2_32.dll",
             "GetAddrInfoW",
             hooks_dns::hooked_GetAddrInfoW as u64,
-        ) else {
-            let mut context = lock_context();
-            context.last_error = "Failed to create hook for GetAddrInfoW".to_owned();
-            return FAILURE;
-        };
-
-        if let Err(e) = get_addr_info_w_hook.hook() {
-            let mut context = lock_context();
-            context.last_error = format!("Failed to hook GetAddrInfoW: {e:#}");
+        ) != SUCCESS
+        {
             return FAILURE;
         }
-
-        let mut context = lock_context();
-        context.hooks.push(get_addr_info_w_hook);
-        drop(context);
 
         let Ok(mut free_addr_info_w_hook) = HookContext::new(
             "ws2_32.dll",
@@ -737,204 +687,95 @@ unsafe fn initialize(
     }
 
     // hook connect to insert our socks proxies
-    let Ok(mut connect_hook) = HookContext::new(
+    if install_hook(
         "ws2_32.dll",
         "connect",
         hooks_sockets::hooked_connect as u64,
-    ) else {
-        let mut context = lock_context();
-        context.last_error = "Failed to create hook for connect".to_owned();
-        return FAILURE;
-    };
-
-    if let Err(e) = connect_hook.hook() {
-        let mut context = lock_context();
-        context.last_error = format!("Failed to hook connect: {e:#}");
+    ) != SUCCESS
+    {
         return FAILURE;
     }
 
-    let mut context = lock_context();
-    context.hooks.push(connect_hook);
-    drop(context);
-
-    let Ok(mut wsa_connect_hook) = HookContext::new(
+    if install_hook(
         "ws2_32.dll",
         "WSAConnect",
         hooks_sockets::hooked_WSAConnect as u64,
-    ) else {
-        let mut context = lock_context();
-        context.last_error = "Failed to create hook for WSAConnect".to_owned();
-        return FAILURE;
-    };
-
-    if let Err(e) = wsa_connect_hook.hook() {
-        let mut context = lock_context();
-        context.last_error = format!("Failed to hook WSAConnect: {e:#}");
+    ) != SUCCESS
+    {
         return FAILURE;
     }
 
-    let mut context = lock_context();
-    context.hooks.push(wsa_connect_hook);
-    drop(context);
-
-    let Ok(mut ioctlsocket_hook) = HookContext::new(
+    if install_hook(
         "ws2_32.dll",
         "ioctlsocket",
         hooks_sockets::hooked_ioctlsocket as u64,
-    ) else {
-        let mut context = lock_context();
-        context.last_error = "Failed to create hook for ioctlsocket".to_owned();
-        return FAILURE;
-    };
-
-    if let Err(e) = ioctlsocket_hook.hook() {
-        let mut context = lock_context();
-        context.last_error = format!("Failed to hook ioctlsocket: {e:#}");
+    ) != SUCCESS
+    {
         return FAILURE;
     }
 
-    let mut context = lock_context();
-    context.hooks.push(ioctlsocket_hook);
-    drop(context);
-
-    let Ok(mut wsa_event_select_hook) = HookContext::new(
+    if install_hook(
         "ws2_32.dll",
         "WSAEventSelect",
         hooks_sockets::hooked_WSAEventSelect as u64,
-    ) else {
-        let mut context = lock_context();
-        context.last_error = "Failed to create hook for WSAEventSelect".to_owned();
-        return FAILURE;
-    };
-
-    if let Err(e) = wsa_event_select_hook.hook() {
-        let mut context = lock_context();
-        context.last_error = format!("Failed to hook WSAEventSelect: {e:#}");
+    ) != SUCCESS
+    {
         return FAILURE;
     }
 
-    let mut context = lock_context();
-    context.hooks.push(wsa_event_select_hook);
-    drop(context);
-
-    let Ok(mut wsa_async_select_hook) = HookContext::new(
+    if install_hook(
         "ws2_32.dll",
         "WSAAsyncSelect",
         hooks_sockets::hooked_WSAAsyncSelect as u64,
-    ) else {
-        let mut context = lock_context();
-        context.last_error = "Failed to create hook for WSAAsyncSelect".to_owned();
-        return FAILURE;
-    };
-
-    if let Err(e) = wsa_async_select_hook.hook() {
-        let mut context = lock_context();
-        context.last_error = format!("Failed to hook WSAAsyncSelect: {e:#}");
+    ) != SUCCESS
+    {
         return FAILURE;
     }
 
-    let mut context = lock_context();
-    context.hooks.push(wsa_async_select_hook);
-    drop(context);
-
-    let Ok(mut wsa_ioctl_hook) = HookContext::new(
+    if install_hook(
         "ws2_32.dll",
         "WSAIoctl",
         hooks_sockets::hooked_WSAIoctl as u64,
-    ) else {
-        let mut context = lock_context();
-        context.last_error = "Failed to create hook for WSAIoctl".to_owned();
-        return FAILURE;
-    };
-
-    if let Err(e) = wsa_ioctl_hook.hook() {
-        let mut context = lock_context();
-        context.last_error = format!("Failed to hook WSAIoctl: {e:#}");
+    ) != SUCCESS
+    {
         return FAILURE;
     }
 
-    let mut context = lock_context();
-    context.hooks.push(wsa_ioctl_hook);
-    drop(context);
-
-    let Ok(mut create_iocp_hook) = HookContext::new(
+    if install_hook(
         "kernelbase.dll",
         "CreateIoCompletionPort",
         hooks_sockets::hooked_CreateIoCompletionPort as u64,
-    ) else {
-        let mut context = lock_context();
-        context.last_error = "Failed to create hook for CreateIoCompletionPort".to_owned();
-        return FAILURE;
-    };
-
-    if let Err(e) = create_iocp_hook.hook() {
-        let mut context = lock_context();
-        context.last_error = format!("Failed to hook CreateIoCompletionPort: {e:#}");
+    ) != SUCCESS
+    {
         return FAILURE;
     }
 
-    let mut context = lock_context();
-    context.hooks.push(create_iocp_hook);
-    drop(context);
-
-    let Ok(mut setsockopt_hook) = HookContext::new(
+    if install_hook(
         "ws2_32.dll",
         "setsockopt",
         hooks_sockets::hooked_setsockopt as u64,
-    ) else {
-        let mut context = lock_context();
-        context.last_error = "Failed to create hook for setsockopt".to_owned();
-        return FAILURE;
-    };
-
-    if let Err(e) = setsockopt_hook.hook() {
-        let mut context = lock_context();
-        context.last_error = format!("Failed to hook setsockopt: {e:#}");
+    ) != SUCCESS
+    {
         return FAILURE;
     }
 
-    let mut context = lock_context();
-    context.hooks.push(setsockopt_hook);
-    drop(context);
-
-    let Ok(mut wsa_get_overlapped_result_hook) = HookContext::new(
+    if install_hook(
         "ws2_32.dll",
         "WSAGetOverlappedResult",
         hooks_sockets::hooked_WSAGetOverlappedResult as u64,
-    ) else {
-        let mut context = lock_context();
-        context.last_error = "Failed to create hook for WSAGetOverlappedResult".to_owned();
-        return FAILURE;
-    };
-
-    if let Err(e) = wsa_get_overlapped_result_hook.hook() {
-        let mut context = lock_context();
-        context.last_error = format!("Failed to hook WSAGetOverlappedResult: {e:#}");
+    ) != SUCCESS
+    {
         return FAILURE;
     }
 
-    let mut context = lock_context();
-    context.hooks.push(wsa_get_overlapped_result_hook);
-    drop(context);
-
-    let Ok(mut closesocket_hook) = HookContext::new(
+    if install_hook(
         "ws2_32.dll",
         "closesocket",
         hooks_sockets::hooked_closesocket as u64,
-    ) else {
-        let mut context = lock_context();
-        context.last_error = "Failed to create hook for closesocket".to_owned();
-        return FAILURE;
-    };
-
-    if let Err(e) = closesocket_hook.hook() {
-        let mut context = lock_context();
-        context.last_error = format!("Failed to hook closesocket: {e:#}");
+    ) != SUCCESS
+    {
         return FAILURE;
     }
-
-    let mut context = lock_context();
-    context.hooks.push(closesocket_hook);
 
     SUCCESS
 }

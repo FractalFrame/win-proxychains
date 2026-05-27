@@ -1,10 +1,4 @@
-use alloc::{
-    borrow::ToOwned,
-    boxed::Box,
-    format,
-    string::String,
-    vec::Vec,
-};
+use alloc::{borrow::ToOwned, boxed::Box, format, string::String, vec::Vec};
 use core::{
     ffi::CStr,
     iter,
@@ -186,7 +180,9 @@ unsafe fn pcwstr_to_string(value: *const u16) -> Option<String> {
         len += 1;
     }
 
-    Some(String::from_utf16_lossy(unsafe { slice::from_raw_parts(value, len) }))
+    Some(String::from_utf16_lossy(unsafe {
+        slice::from_raw_parts(value, len)
+    }))
 }
 
 fn wide_null(value: &str) -> Vec<u16> {
@@ -935,8 +931,7 @@ unsafe fn o_freeaddrinfo(context: &mut Context, result: *const ADDRINFOA) {
         return;
     };
 
-    let original: unsafe extern "system" fn(*const ADDRINFOA) =
-        unsafe { mem::transmute(fptr) };
+    let original: unsafe extern "system" fn(*const ADDRINFOA) = unsafe { mem::transmute(fptr) };
     unsafe { original(result) }
 }
 
@@ -980,8 +975,7 @@ pub unsafe fn o_FreeAddrInfoW(context: &mut Context, result: *const ADDRINFOW) {
         return;
     };
 
-    let original: unsafe extern "system" fn(*const ADDRINFOW) =
-        unsafe { mem::transmute(fptr) };
+    let original: unsafe extern "system" fn(*const ADDRINFOW) = unsafe { mem::transmute(fptr) };
     unsafe { original(result) }
 }
 
@@ -1305,8 +1299,8 @@ mod tests {
         ffi::CStr,
         net::{IpAddr, Ipv4Addr, Ipv6Addr},
         ptr::null_mut,
-        sync::Mutex,
         string::ToString,
+        sync::Mutex,
         vec,
     };
     use windows_sys::Win32::Networking::WinSock::HOSTENT;
@@ -1462,7 +1456,11 @@ mod tests {
             );
         }
 
-        assert!(context.owned_addrinfo_a_roots.contains(&(result_a as usize)));
+        assert!(
+            context
+                .owned_addrinfo_a_roots
+                .contains(&(result_a as usize))
+        );
         assert!(context.owned_addrinfow_roots.contains(&(result_w as usize)));
 
         assert!(super::try_free_owned_addrinfo_alias_in_context(

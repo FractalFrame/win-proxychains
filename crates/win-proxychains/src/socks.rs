@@ -1,12 +1,6 @@
-use alloc::{
-    format,
-    string::ToString,
-    vec,
-    vec::Vec,
-};
+use alloc::{format, string::ToString, vec, vec::Vec};
 use core::{
-    fmt,
-    iter,
+    fmt, iter,
     mem::{self, size_of},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     ptr::null_mut,
@@ -16,13 +10,10 @@ use anyhow::Result;
 use windows_sys::Win32::Networking::WinSock::{
     ADDRINFOW, AF_INET, AF_INET6, AF_UNSPEC, IN_ADDR, IN_ADDR_0, IN_ADDR_0_0, IN6_ADDR, IN6_ADDR_0,
     IPPROTO_TCP, SO_RCVTIMEO, SO_SNDTIMEO, SOCK_STREAM, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6,
-    SOCKADDR_IN6_0, SOCKET, SOL_SOCKET, WSAEALREADY, WSAEINPROGRESS, WSAEISCONN, WSAEWOULDBLOCK,
-    WSAGetLastError,
+    SOCKADDR_IN6_0, SOCKADDR_STORAGE, SOCKET, SOL_SOCKET, WSAEALREADY, WSAEINPROGRESS, WSAEISCONN,
+    WSAEWOULDBLOCK, WSAGetLastError, getsockname,
 };
-use windows_sys::Win32::System::{
-    SystemInformation::GetTickCount64,
-    Threading::Sleep,
-};
+use windows_sys::Win32::System::{SystemInformation::GetTickCount64, Threading::Sleep};
 
 use crate::{
     Context,
@@ -618,6 +609,59 @@ fn resolve_targets(context: &mut Context, name: &str, port: u16) -> Result<Vec<S
     Ok(targets)
 }
 
+fn socket_address_family(socket: SOCKET) -> Option<i32> {
+    let mut storage = SOCKADDR_STORAGE::default();
+    let mut storage_len = size_of::<SOCKADDR_STORAGE>() as i32;
+    let result = unsafe {
+        getsockname(
+            socket,
+            &mut storage as *mut SOCKADDR_STORAGE as *mut SOCKADDR,
+            &mut storage_len,
+        )
+    };
+
+    (result == 0).then_some(storage.ss_family as i32)
+}
+
+fn resolve_targets_for_socket(
+    context: &mut Context,
+    socket: SOCKET,
+    name: &str,
+    port: u16,
+) -> Result<Vec<SocketAddr>> {
+    let targets = resolve_targets(context, name, port)?;
+    let Some(socket_family) = socket_address_family(socket) else {
+        return Ok(targets);
+    };
+
+    let compatible_targets = targets
+        .into_iter()
+        .filter_map(|target| match (socket_family, target) {
+            (family, SocketAddr::V4(addr)) if family == AF_INET as i32 => {
+                Some(SocketAddr::V4(addr))
+            }
+            (family, SocketAddr::V4(addr)) if family == AF_INET6 as i32 => Some(SocketAddr::V6(
+                SocketAddrV6::new(addr.ip().to_ipv6_mapped(), addr.port(), 0, 0),
+            )),
+            (family, SocketAddr::V6(addr)) if family == AF_INET6 as i32 => {
+                Some(SocketAddr::V6(addr))
+            }
+            (family, target) if family != AF_INET as i32 && family != AF_INET6 as i32 => {
+                Some(target)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    if compatible_targets.is_empty() {
+        return Err(anyhow::anyhow!(
+            "No {name}:{port} addresses are compatible with socket family {socket_family}"
+        ));
+    }
+
+    Ok(compatible_targets)
+}
+
 pub fn connect_socket(
     context: &mut Context,
     socket: SOCKET,
@@ -627,7 +671,7 @@ pub fn connect_socket(
 ) -> Result<()> {
     // A note about proxy_dns, we _do_ leak the addresses of the proxy here
     // proxy_dns does not prevent DNS lookups for your proxies, it only prevents lookups for the final destination.
-    let targets = resolve_targets(context, name, port)?;
+    let targets = resolve_targets_for_socket(context, socket, name, port)?;
     let connect_timeout = new_spin_timeout(Some(connect_timeout_ms));
     let timeout_context = format!("connecting socket to {name}:{port}");
 

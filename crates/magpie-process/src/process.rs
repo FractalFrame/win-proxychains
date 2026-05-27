@@ -9,12 +9,7 @@ use alloc::{
     vec,
     vec::Vec,
 };
-use core::{
-    cmp::Ordering,
-    ffi::c_void,
-    mem,
-    ops::Range,
-};
+use core::{cmp::Ordering, ffi::c_void, mem, ops::Range};
 
 use anyhow::Result;
 use windows_sys::{
@@ -51,8 +46,8 @@ use windows_sys::{
             RemoteDesktop::ProcessIdToSessionId,
             SystemInformation::{GetSystemInfo, SYSTEM_INFO},
             Threading::{
-                CreateProcessW, CreateRemoteThread, GetExitCodeProcess, OpenProcess, OpenThread,
-                GetCurrentProcessId, PROCESS_BASIC_INFORMATION, PROCESS_CREATE_THREAD,
+                CreateProcessW, CreateRemoteThread, GetCurrentProcessId, GetExitCodeProcess,
+                OpenProcess, OpenThread, PROCESS_BASIC_INFORMATION, PROCESS_CREATE_THREAD,
                 PROCESS_INFORMATION, PROCESS_QUERY_INFORMATION, PROCESS_TERMINATE,
                 PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE, ResumeThread,
                 STARTUPINFOW, SuspendThread, THREAD_GET_CONTEXT, THREAD_SET_CONTEXT,

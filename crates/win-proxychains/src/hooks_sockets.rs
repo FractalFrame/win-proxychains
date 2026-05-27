@@ -9,8 +9,7 @@ use core::{
     mem::{self, size_of, size_of_val},
     net::Ipv6Addr,
     ptr::{copy_nonoverlapping, null_mut},
-    result,
-    slice,
+    result, slice,
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -1380,22 +1379,334 @@ pub unsafe extern "system" fn hooked_closesocket(socket: SOCKET) -> i32 {
 #[cfg(all(test, target_arch = "x86_64"))]
 mod tests {
     use super::{
-        clear_synthetic_connectex, connect_success_result, record_socket_async_select,
-        record_socket_event_select, record_socket_nonblocking, record_synthetic_connectex,
-        remove_socket_state, reset_socket_connect_tracking, socket_allows_connect_context_update,
-        socket_connect_contract, synthetic_connectex,
+        clear_synthetic_connectex, connect_success_result, hooked_ConnectEx, hooked_WSAConnect,
+        hooked_connect, record_socket_async_select, record_socket_event_select,
+        record_socket_nonblocking, record_synthetic_connectex, remove_socket_state,
+        reset_o_connect_for_tests, reset_socket_connect_tracking, set_o_connect_for_tests,
+        socket_allows_connect_context_update, socket_connect_contract, synthetic_connectex,
     };
-    use crate::{SocketConnectContract, lock_context};
-    use std::sync::Mutex;
-    use windows_sys::Win32::Networking::WinSock::{FD_CONNECT, WSAEWOULDBLOCK};
+    use crate::{SocketConnectContract, config::ProxychainsConfig, lock_context};
+    use std::{
+        format,
+        io::{Read, Write},
+        mem::size_of,
+        net::Ipv4Addr,
+        ptr::{null, null_mut},
+        sync::{Mutex, Once},
+        thread, vec,
+    };
+    use windows_sys::Win32::Networking::WinSock::{
+        AF_INET, AF_INET6, FD_CONNECT, IN_ADDR, IN_ADDR_0, IN_ADDR_0_0, IN6_ADDR, IN6_ADDR_0,
+        INVALID_SOCKET, IPPROTO_IPV6, IPPROTO_TCP, IPV6_V6ONLY, SOCK_STREAM, SOCKADDR, SOCKADDR_IN,
+        SOCKADDR_IN6, SOCKADDR_IN6_0, SOCKET, WSADATA, WSAEWOULDBLOCK, WSAGetLastError, WSAStartup,
+        bind, closesocket, connect, setsockopt, socket,
+    };
     use windows_sys::Win32::System::IO::OVERLAPPED;
 
     static TEST_MUTEX: Mutex<()> = Mutex::new(());
+    static WINSOCK_INIT: Once = Once::new();
 
     fn lock_tests() -> std::sync::MutexGuard<'static, ()> {
         TEST_MUTEX
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn ensure_winsock_started() {
+        WINSOCK_INIT.call_once(|| {
+            let mut wsadata = std::mem::MaybeUninit::<WSADATA>::zeroed();
+            let startup_result = unsafe { WSAStartup(0x0202, wsadata.as_mut_ptr()) };
+            assert_eq!(startup_result, 0, "WSAStartup failed with {startup_result}");
+        });
+    }
+
+    struct OriginalConnectGuard;
+
+    impl OriginalConnectGuard {
+        fn install() -> Self {
+            set_o_connect_for_tests(connect);
+            Self
+        }
+    }
+
+    impl Drop for OriginalConnectGuard {
+        fn drop(&mut self) {
+            reset_o_connect_for_tests();
+        }
+    }
+
+    fn start_ipv4_socks5_proxy() -> (u16, thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .expect("test SOCKS5 proxy should bind");
+        let port = listener
+            .local_addr()
+            .expect("test SOCKS5 proxy should expose local address")
+            .port();
+
+        let thread = thread::spawn(move || {
+            let (mut stream, _) = listener
+                .accept()
+                .expect("test SOCKS5 proxy should accept a client");
+            let mut greeting = [0u8; 3];
+            stream
+                .read_exact(&mut greeting)
+                .expect("SOCKS5 greeting should be sent");
+            assert_eq!(greeting, [0x05, 0x01, 0x00]);
+            stream
+                .write_all(&[0x05, 0x00])
+                .expect("SOCKS5 greeting response should be written");
+
+            let mut request_header = [0u8; 4];
+            stream
+                .read_exact(&mut request_header)
+                .expect("SOCKS5 request header should be sent");
+            assert_eq!(request_header[0], 0x05);
+            assert_eq!(request_header[1], 0x01);
+            assert_eq!(request_header[2], 0x00);
+
+            match request_header[3] {
+                0x01 => {
+                    let mut address_and_port = [0u8; 6];
+                    stream
+                        .read_exact(&mut address_and_port)
+                        .expect("IPv4 SOCKS5 destination should be sent");
+                }
+                0x03 => {
+                    let mut len = [0u8; 1];
+                    stream
+                        .read_exact(&mut len)
+                        .expect("domain length should be sent");
+                    let mut address_and_port = vec![0u8; len[0] as usize + 2];
+                    stream
+                        .read_exact(&mut address_and_port)
+                        .expect("domain SOCKS5 destination should be sent");
+                }
+                0x04 => {
+                    let mut address_and_port = [0u8; 18];
+                    stream
+                        .read_exact(&mut address_and_port)
+                        .expect("IPv6 SOCKS5 destination should be sent");
+                }
+                address_type => panic!("unexpected SOCKS5 address type {address_type:#x}"),
+            }
+
+            stream
+                .write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0])
+                .expect("SOCKS5 success response should be written");
+        });
+
+        (port, thread)
+    }
+
+    unsafe fn close_socket(socket: SOCKET) {
+        if socket != INVALID_SOCKET {
+            unsafe {
+                closesocket(socket);
+            }
+        }
+    }
+
+    fn dual_stack_ipv6_socket() -> SOCKET {
+        let socket = unsafe { socket(AF_INET6 as i32, SOCK_STREAM, IPPROTO_TCP) };
+        assert_ne!(socket, INVALID_SOCKET, "AF_INET6 socket should be created");
+
+        let v6_only = 0u32;
+        let setsockopt_result = unsafe {
+            setsockopt(
+                socket,
+                IPPROTO_IPV6 as i32,
+                IPV6_V6ONLY,
+                &v6_only as *const u32 as *const u8,
+                size_of::<u32>() as i32,
+            )
+        };
+        if setsockopt_result != 0 {
+            let error = unsafe { WSAGetLastError() };
+            unsafe {
+                close_socket(socket);
+            }
+            panic!("setsockopt(IPV6_V6ONLY=0) failed with WSA error {error}");
+        }
+
+        let bind_addr = SOCKADDR_IN6 {
+            sin6_family: AF_INET6,
+            sin6_port: 0,
+            sin6_flowinfo: 0,
+            sin6_addr: IN6_ADDR {
+                u: IN6_ADDR_0 { Byte: [0; 16] },
+            },
+            Anonymous: SOCKADDR_IN6_0 { sin6_scope_id: 0 },
+        };
+        let bind_result = unsafe {
+            bind(
+                socket,
+                &bind_addr as *const SOCKADDR_IN6 as *const SOCKADDR,
+                size_of::<SOCKADDR_IN6>() as i32,
+            )
+        };
+        if bind_result != 0 {
+            let error = unsafe { WSAGetLastError() };
+            unsafe {
+                close_socket(socket);
+            }
+            panic!("bind(AF_INET6 any) failed with WSA error {error}");
+        }
+
+        socket
+    }
+
+    fn configure_ipv4_proxy_context(proxy_port: u16) {
+        let mut context = lock_context();
+        context.last_error.clear();
+        context.config = Some(
+            ProxychainsConfig::parse(&format!(
+                "strict_chain\n[ProxyList]\nsocks5 127.0.0.1 {proxy_port}\n"
+            ))
+            .expect("test proxy config should parse"),
+        );
+        context
+            .socket_states
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+
+    fn ipv4_destination_sockaddr() -> SOCKADDR_IN {
+        SOCKADDR_IN {
+            sin_family: AF_INET,
+            sin_port: 80u16.to_be(),
+            sin_addr: IN_ADDR {
+                S_un: IN_ADDR_0 {
+                    S_un_b: IN_ADDR_0_0 {
+                        s_b1: 203,
+                        s_b2: 0,
+                        s_b3: 113,
+                        s_b4: 10,
+                    },
+                },
+            },
+            sin_zero: [0; 8],
+        }
+    }
+
+    #[test]
+    fn connect_handles_dual_stack_socket_with_ipv4_proxy() {
+        let _guard = lock_tests();
+        ensure_winsock_started();
+        let _connect_guard = OriginalConnectGuard::install();
+        let (proxy_port, proxy_thread) = start_ipv4_socks5_proxy();
+        configure_ipv4_proxy_context(proxy_port);
+
+        let socket = dual_stack_ipv6_socket();
+        let destination = ipv4_destination_sockaddr();
+
+        let result = unsafe {
+            hooked_connect(
+                socket,
+                &destination as *const SOCKADDR_IN as *const SOCKADDR,
+                size_of::<SOCKADDR_IN>() as i32,
+            )
+        };
+        let wsa_error = unsafe { WSAGetLastError() };
+        unsafe {
+            close_socket(socket);
+        }
+
+        proxy_thread
+            .join()
+            .expect("test SOCKS5 proxy thread should not panic");
+
+        if result != 0 {
+            let context = lock_context();
+            panic!(
+                "hooked_connect failed on a dual-stack socket through an IPv4 proxy: WSA error {wsa_error}; {}",
+                context.last_error
+            );
+        }
+    }
+
+    #[test]
+    fn wsa_connect_handles_dual_stack_socket_with_ipv4_proxy() {
+        let _guard = lock_tests();
+        ensure_winsock_started();
+        let _connect_guard = OriginalConnectGuard::install();
+        let (proxy_port, proxy_thread) = start_ipv4_socks5_proxy();
+        configure_ipv4_proxy_context(proxy_port);
+
+        let socket = dual_stack_ipv6_socket();
+        let destination = ipv4_destination_sockaddr();
+
+        let result = unsafe {
+            hooked_WSAConnect(
+                socket,
+                &destination as *const SOCKADDR_IN as *const SOCKADDR,
+                size_of::<SOCKADDR_IN>() as i32,
+                null(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+            )
+        };
+        let wsa_error = unsafe { WSAGetLastError() };
+        unsafe {
+            close_socket(socket);
+        }
+
+        proxy_thread
+            .join()
+            .expect("test SOCKS5 proxy thread should not panic");
+
+        if result != 0 {
+            let context = lock_context();
+            panic!(
+                "hooked_WSAConnect failed on a dual-stack socket through an IPv4 proxy: WSA error {wsa_error}; {}",
+                context.last_error
+            );
+        }
+    }
+
+    #[test]
+    fn connectex_handles_dual_stack_socket_with_ipv4_proxy() {
+        let _guard = lock_tests();
+        ensure_winsock_started();
+        let _connect_guard = OriginalConnectGuard::install();
+        let (proxy_port, proxy_thread) = start_ipv4_socks5_proxy();
+        configure_ipv4_proxy_context(proxy_port);
+
+        let socket = dual_stack_ipv6_socket();
+        let destination = ipv4_destination_sockaddr();
+        let mut overlapped = OVERLAPPED::default();
+        let mut bytes_sent = u32::MAX;
+
+        let result = unsafe {
+            hooked_ConnectEx(
+                socket,
+                &destination as *const SOCKADDR_IN as *const SOCKADDR,
+                size_of::<SOCKADDR_IN>() as i32,
+                null(),
+                0,
+                &mut bytes_sent,
+                &mut overlapped,
+            )
+        };
+        let wsa_error = unsafe { WSAGetLastError() };
+        unsafe {
+            close_socket(socket);
+        }
+
+        proxy_thread
+            .join()
+            .expect("test SOCKS5 proxy thread should not panic");
+
+        if result == 0 {
+            let context = lock_context();
+            panic!(
+                "hooked_ConnectEx failed on a dual-stack socket through an IPv4 proxy: WSA error {wsa_error}; {}",
+                context.last_error
+            );
+        }
+
+        assert_eq!(bytes_sent, 0);
     }
 
     #[test]

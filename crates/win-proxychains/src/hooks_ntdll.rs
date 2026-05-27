@@ -70,7 +70,6 @@ pub unsafe extern "system" fn hooked_NtCreateUserProcess(
     create_info: *mut c_void,
     attribute_list: *mut c_void,
 ) -> i32 {
-
     // check if we have the quick-call fptr already
     let fptr = FPTR_O_NT_CREATE_USER_PROCESS.load(Ordering::SeqCst);
     if fptr == 0 {

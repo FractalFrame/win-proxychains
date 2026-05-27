@@ -4,6 +4,7 @@ use alloc::{
     string::{String, ToString},
     vec::Vec,
 };
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use core::{
     fmt,
     hash::{Hash, Hasher},
@@ -11,7 +12,6 @@ use core::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6},
     str::FromStr,
 };
-use anyhow::{Context, Result, anyhow, bail, ensure};
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6,
 };

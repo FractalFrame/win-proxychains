@@ -64,12 +64,8 @@ impl HookContext {
             }
         }
 
-        let h_proc = unsafe {
-            GetProcAddress(
-                h_module,
-                CString::new(function)?.as_ptr() as *const _,
-            )
-        };
+        let h_proc =
+            unsafe { GetProcAddress(h_module, CString::new(function)?.as_ptr() as *const _) };
 
         let Some(h_proc) = h_proc else {
             return bail_with_last_error(format!(

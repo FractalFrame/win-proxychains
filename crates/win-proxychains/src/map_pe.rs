@@ -1,22 +1,8 @@
-use alloc::{
-    ffi::CString,
-    format,
-    string::ToString,
-    vec,
-    vec::Vec,
-};
+use alloc::{ffi::CString, format, string::ToString, vec, vec::Vec};
 use core::{ffi::c_void, iter, mem, ptr};
 
 use anyhow::Result;
 use magpie_process::{MemorySection, ParsedNtHeaders, ParsedPeFile, Process};
-use windows_sys::Win32::{
-    Foundation::{CloseHandle, GENERIC_READ, INVALID_HANDLE_VALUE},
-    Storage::FileSystem::{
-        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, GetFileSizeEx, OPEN_EXISTING,
-        ReadFile,
-    },
-    System::Memory::PAGE_EXECUTE_WRITECOPY,
-};
 use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
 use windows_sys::Win32::System::SystemServices::{
     DLL_PROCESS_ATTACH, IMAGE_BASE_RELOCATION, IMAGE_EXPORT_DIRECTORY, IMAGE_REL_BASED_ABSOLUTE,
@@ -27,6 +13,13 @@ use windows_sys::Win32::System::{
     Memory::{PAGE_EXECUTE_READWRITE, SECTION_MAP_EXECUTE, SECTION_MAP_READ, SECTION_MAP_WRITE},
     SystemInformation::GetTickCount64,
     Threading::GetCurrentProcessId,
+};
+use windows_sys::Win32::{
+    Foundation::{CloseHandle, GENERIC_READ, INVALID_HANDLE_VALUE},
+    Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, GetFileSizeEx, OPEN_EXISTING, ReadFile,
+    },
+    System::Memory::PAGE_EXECUTE_WRITECOPY,
 };
 
 use crate::bail_with_last_error;
@@ -102,8 +95,8 @@ pub fn map_and_load_pe(
     path: &str,
     required_bases_in_range: &[u64],
 ) -> Result<(u64, MemorySection)> {
-    let pe_bytes = read_file(path)
-        .map_err(|e| anyhow::anyhow!("failed to read PE file {path}: {e}"))?;
+    let pe_bytes =
+        read_file(path).map_err(|e| anyhow::anyhow!("failed to read PE file {path}: {e}"))?;
     let pe = ParsedPeFile::parse(&pe_bytes)?;
     let sections = pe.sections()?;
 
@@ -118,11 +111,7 @@ pub fn map_and_load_pe(
 
     let timestamp = unsafe { GetTickCount64() };
 
-    let name = format!(
-        "win-proxy-section-{}-{}",
-        basename(path),
-        timestamp
-    );
+    let name = format!("win-proxy-section-{}-{}", basename(path), timestamp);
 
     let section = MemorySection::create_section(
         &name,
@@ -314,11 +303,7 @@ pub fn execute_dll_main(image_base: *const c_void) -> Result<()> {
         let dll_main: extern "system" fn(*mut u8, u32, *mut u8) = mem::transmute(dll_main_fptr);
 
         // call dll main with process attach
-        dll_main(
-            image_base as *mut u8,
-            DLL_PROCESS_ATTACH,
-            ptr::null_mut(),
-        );
+        dll_main(image_base as *mut u8, DLL_PROCESS_ATTACH, ptr::null_mut());
     };
 
     Ok(())
@@ -353,11 +338,7 @@ pub fn execute_tls(image_base: *const c_void) -> Result<()> {
 
                         let callback_fn: extern "system" fn(*mut u8, u32, *mut u8) =
                             unsafe { mem::transmute(callback as usize) };
-                        callback_fn(
-                            image_base as *mut u8,
-                            DLL_PROCESS_ATTACH,
-                            ptr::null_mut(),
-                        );
+                        callback_fn(image_base as *mut u8, DLL_PROCESS_ATTACH, ptr::null_mut());
                         callbacks_rva += mem::size_of::<u64>();
                     }
                 }
@@ -379,11 +360,7 @@ pub fn execute_tls(image_base: *const c_void) -> Result<()> {
 
                         let callback_fn: extern "system" fn(*mut u8, u32, *mut u8) =
                             unsafe { mem::transmute(callback as usize) };
-                        callback_fn(
-                            image_base as *mut u8,
-                            DLL_PROCESS_ATTACH,
-                            ptr::null_mut(),
-                        );
+                        callback_fn(image_base as *mut u8, DLL_PROCESS_ATTACH, ptr::null_mut());
                         callbacks_rva += mem::size_of::<u32>();
                     }
                 }

@@ -14,12 +14,13 @@ mod scoped_handle;
 
 #[cfg(feature = "global-allocator")]
 #[global_allocator]
-static GLOBAL_ALLOCATOR: winapi_allocator::WinApiAllocator = winapi_allocator::WinApiAllocator::new();
+static GLOBAL_ALLOCATOR: winapi_allocator::WinApiAllocator =
+    winapi_allocator::WinApiAllocator::new();
 
-pub use winapi_allocator::WinApiAllocator;
 pub use pe_file::{ParsedNtHeaders, ParsedPeFile, SectionTable};
 pub use process::{
     AnalysedModuleInfo, MemoryInfo, MemoryMap, MemorySection, ModuleInfo, Process, ProcessBuilder,
     Section, Thread,
 };
 pub use scoped_handle::ScopedHandle;
+pub use winapi_allocator::WinApiAllocator;
