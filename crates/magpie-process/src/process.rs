@@ -9,22 +9,28 @@ use alloc::{
     vec,
     vec::Vec,
 };
-use core::{cmp::Ordering, ffi::c_void, mem, ops::Range};
+use core::{cmp::Ordering, ffi::c_void, fmt, mem, ops::Range};
 
 use anyhow::Result;
 use windows_sys::{
     Wdk::{
         Foundation::OBJECT_ATTRIBUTES,
+        Storage::FileSystem::ZwOpenDirectoryObject,
         System::{
             Memory::{ViewUnmap, ZwMapViewOfSection, ZwOpenSection, ZwUnmapViewOfSection},
-            SystemServices::ZwCreateSection,
+            SystemServices::{
+                DIRECTORY_CREATE_OBJECT, DIRECTORY_QUERY, DIRECTORY_TRAVERSE, ZwCreateSection,
+            },
             Threading::{NtQueryInformationProcess, ProcessBasicInformation},
         },
     },
     Win32::{
         Foundation::{
             CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE, NTSTATUS,
-            OBJ_CASE_INSENSITIVE, STILL_ACTIVE, UNICODE_STRING,
+            OBJ_CASE_INSENSITIVE, STATUS_ACCESS_DENIED, STATUS_INVALID_PARAMETER,
+            STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_INVALID, STATUS_OBJECT_NAME_NOT_FOUND,
+            STATUS_OBJECT_PATH_INVALID, STATUS_OBJECT_PATH_NOT_FOUND,
+            STATUS_OBJECT_PATH_SYNTAX_BAD, STATUS_SUCCESS, STILL_ACTIVE, UNICODE_STRING,
         },
         System::{
             Diagnostics::{
@@ -81,14 +87,30 @@ fn bail_with_last_error<T>(message: &str) -> Result<T> {
 
 fn bail_with_ntstatus<T>(message: &str, status: NTSTATUS) -> Result<T> {
     Err(anyhow::anyhow!(
-        "{}: NTSTATUS 0x{:08X}",
+        "{}: {} ({:#010X})",
         message,
+        ntstatus_name(status),
         status as u32
     ))
 }
 
 fn nt_success(status: NTSTATUS) -> bool {
     status >= 0
+}
+
+fn ntstatus_name(status: NTSTATUS) -> &'static str {
+    match status {
+        STATUS_SUCCESS => "STATUS_SUCCESS",
+        STATUS_ACCESS_DENIED => "STATUS_ACCESS_DENIED",
+        STATUS_INVALID_PARAMETER => "STATUS_INVALID_PARAMETER",
+        STATUS_OBJECT_NAME_COLLISION => "STATUS_OBJECT_NAME_COLLISION",
+        STATUS_OBJECT_NAME_INVALID => "STATUS_OBJECT_NAME_INVALID",
+        STATUS_OBJECT_NAME_NOT_FOUND => "STATUS_OBJECT_NAME_NOT_FOUND",
+        STATUS_OBJECT_PATH_INVALID => "STATUS_OBJECT_PATH_INVALID",
+        STATUS_OBJECT_PATH_NOT_FOUND => "STATUS_OBJECT_PATH_NOT_FOUND",
+        STATUS_OBJECT_PATH_SYNTAX_BAD => "STATUS_OBJECT_PATH_SYNTAX_BAD",
+        _ => "UNKNOWN_NTSTATUS",
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -121,8 +143,207 @@ const MIN_OPTIONAL_HEADER_FOR_SIZE_OF_IMAGE: usize = OPTIONAL_HEADER_SIZE_OF_IMA
 const OPTIONAL_HEADER_MAGIC_PE32: u16 = 0x10B;
 const OPTIONAL_HEADER_MAGIC_PE32_PLUS: u16 = 0x20B;
 const MAX_REMOTE_HEADER_PROBE: usize = 16 * 1024 * 1024;
+const BASE_NAMED_OBJECTS_DIRECTORY: &str = "\\BaseNamedObjects";
 const BASE_NAMED_OBJECTS_PREFIX: &str = "\\BaseNamedObjects\\";
 const SESSION_BASE_NAMED_OBJECTS_PREFIX: &str = "\\Sessions\\";
+const DIRECTORY_CREATE_SECTION_ACCESS: u32 =
+    DIRECTORY_QUERY | DIRECTORY_TRAVERSE | DIRECTORY_CREATE_OBJECT;
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum SectionNamespaceKind {
+    Absolute,
+    Global,
+    Local,
+    CurrentSession,
+}
+
+impl SectionNamespaceKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Absolute => "absolute",
+            Self::Global => "global",
+            Self::Local => "local",
+            Self::CurrentSession => "current-session",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct SectionNamespaceDiagnostics {
+    requested_name: String,
+    normalized_name: String,
+    current_process_id: u32,
+    current_session_id: Option<u32>,
+    namespace_kind: SectionNamespaceKind,
+    directory_probes: Vec<DirectoryProbe>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct DirectoryProbe {
+    path: String,
+    status: NTSTATUS,
+}
+
+impl DirectoryProbe {
+    fn new(path: String, status: NTSTATUS) -> Self {
+        Self { path, status }
+    }
+
+    fn is_accessible(&self) -> bool {
+        nt_success(self.status)
+    }
+}
+
+impl SectionNamespaceDiagnostics {
+    fn for_name(name: &str) -> Result<Self> {
+        let current_process_id = unsafe { GetCurrentProcessId() };
+
+        if name.starts_with('\\') {
+            return Ok(Self {
+                requested_name: name.to_string(),
+                normalized_name: name.to_string(),
+                current_process_id,
+                current_session_id: current_session_id().ok(),
+                namespace_kind: SectionNamespaceKind::Absolute,
+                directory_probes: Vec::new(),
+            });
+        }
+
+        if let Some(global_name) = name.strip_prefix("Global\\") {
+            return Ok(Self {
+                requested_name: name.to_string(),
+                normalized_name: root_base_named_object_name(global_name),
+                current_process_id,
+                current_session_id: current_session_id().ok(),
+                namespace_kind: SectionNamespaceKind::Global,
+                directory_probes: Vec::new(),
+            });
+        }
+
+        let (local_name, namespace_kind) = match name.strip_prefix("Local\\") {
+            Some(local_name) => (local_name, SectionNamespaceKind::Local),
+            None => (name, SectionNamespaceKind::CurrentSession),
+        };
+        let current_session_id = current_session_id()?;
+        let (normalized_name, directory_probes) =
+            current_session_section_name(local_name, current_session_id)?;
+
+        Ok(Self {
+            requested_name: name.to_string(),
+            normalized_name,
+            current_process_id,
+            current_session_id: Some(current_session_id),
+            namespace_kind,
+            directory_probes,
+        })
+    }
+
+    fn normalized_name(&self) -> &str {
+        &self.normalized_name
+    }
+}
+
+fn current_session_section_name(
+    local_name: &str,
+    session_id: u32,
+) -> Result<(String, Vec<DirectoryProbe>)> {
+    current_session_section_name_with_probe(local_name, session_id, open_directory_object_status)
+}
+
+fn current_session_section_name_with_probe(
+    local_name: &str,
+    session_id: u32,
+    mut probe_directory: impl FnMut(&str) -> Result<NTSTATUS>,
+) -> Result<(String, Vec<DirectoryProbe>)> {
+    let session_directory =
+        format!("{SESSION_BASE_NAMED_OBJECTS_PREFIX}{session_id}\\BaseNamedObjects");
+    let session_status = probe_directory(&session_directory)?;
+    let mut probes = vec![DirectoryProbe::new(
+        session_directory.clone(),
+        session_status,
+    )];
+
+    if probes[0].is_accessible() {
+        return Ok((
+            object_name_in_directory(&session_directory, local_name),
+            probes,
+        ));
+    }
+
+    let root_status = probe_directory(BASE_NAMED_OBJECTS_DIRECTORY)?;
+    probes.push(DirectoryProbe::new(
+        BASE_NAMED_OBJECTS_DIRECTORY.to_string(),
+        root_status,
+    ));
+
+    Ok((root_base_named_object_name(local_name), probes))
+}
+
+fn object_name_in_directory(directory: &str, local_name: &str) -> String {
+    format!("{directory}\\{local_name}")
+}
+
+fn root_base_named_object_name(local_name: &str) -> String {
+    format!("{BASE_NAMED_OBJECTS_PREFIX}{local_name}")
+}
+
+fn open_directory_object_status(path: &str) -> Result<NTSTATUS> {
+    let object_name = OwnedUnicodeString::new(path)?;
+    let object_attributes = build_object_attributes(object_name.as_unicode_string());
+    let mut handle = HANDLE::default();
+    let status = unsafe {
+        ZwOpenDirectoryObject(
+            &mut handle,
+            DIRECTORY_CREATE_SECTION_ACCESS,
+            &object_attributes,
+        )
+    };
+
+    if nt_success(status) && !handle.is_null() {
+        unsafe {
+            CloseHandle(handle);
+        }
+    }
+
+    Ok(status)
+}
+
+impl fmt::Display for SectionNamespaceDiagnostics {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "section_name={{requested={:?}; normalized={:?}; namespace={}; pid={}; session=",
+            self.requested_name,
+            self.normalized_name,
+            self.namespace_kind.as_str(),
+            self.current_process_id,
+        )?;
+
+        match self.current_session_id {
+            Some(session_id) => write!(formatter, "{session_id}")?,
+            None => formatter.write_str("<unavailable>")?,
+        }
+
+        if !self.directory_probes.is_empty() {
+            formatter.write_str("; directory_probes=[")?;
+            for (index, probe) in self.directory_probes.iter().enumerate() {
+                if index != 0 {
+                    formatter.write_str(", ")?;
+                }
+                write!(
+                    formatter,
+                    "{{path={:?}; status={} ({:#010X})}}",
+                    probe.path,
+                    ntstatus_name(probe.status),
+                    probe.status as u32,
+                )?;
+            }
+            formatter.write_str("]")?;
+        }
+
+        formatter.write_str("}")
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct MemorySection {
@@ -149,7 +370,8 @@ impl MemorySection {
 
         let maximum_size = i64::try_from(size)
             .map_err(|_| anyhow::anyhow!("section size {size} does not fit in i64"))?;
-        let object_name = OwnedUnicodeString::new(&normalize_section_name(name)?)?;
+        let diagnostics = SectionNamespaceDiagnostics::for_name(name)?;
+        let object_name = OwnedUnicodeString::new(diagnostics.normalized_name())?;
         let object_attributes = build_object_attributes(object_name.as_unicode_string());
 
         let mut handle = HANDLE::default();
@@ -165,10 +387,15 @@ impl MemorySection {
             )
         };
         if !nt_success(status) {
-            return bail_with_ntstatus(
-                &format!("ZwCreateSection failed for {}", object_name.as_str()),
-                status,
-            );
+            return Err(anyhow::anyhow!(
+                "ZwCreateSection failed: status={} ({:#010X}); {}; access_mask={:#x}; size={:#x}; page_protection={:#x}",
+                ntstatus_name(status),
+                status as u32,
+                diagnostics,
+                access_mask,
+                size,
+                page_protection,
+            ));
         }
 
         Ok(Self {
@@ -185,16 +412,20 @@ impl MemorySection {
     }
 
     pub fn open_section(name: &str, access_mask: u32) -> Result<Self> {
-        let object_name = OwnedUnicodeString::new(&normalize_section_name(name)?)?;
+        let diagnostics = SectionNamespaceDiagnostics::for_name(name)?;
+        let object_name = OwnedUnicodeString::new(diagnostics.normalized_name())?;
         let object_attributes = build_object_attributes(object_name.as_unicode_string());
 
         let mut handle = HANDLE::default();
         let status = unsafe { ZwOpenSection(&mut handle, access_mask, &object_attributes) };
         if !nt_success(status) {
-            return bail_with_ntstatus(
-                &format!("ZwOpenSection failed for {}", object_name.as_str()),
-                status,
-            );
+            return Err(anyhow::anyhow!(
+                "ZwOpenSection failed: status={} ({:#010X}); {}; access_mask={:#x}",
+                ntstatus_name(status),
+                status as u32,
+                diagnostics,
+                access_mask,
+            ));
         }
 
         let page_protection = section_view_protection(access_mask);
@@ -1041,28 +1272,6 @@ fn utf16_nul(text: &str) -> Vec<u16> {
     wide
 }
 
-fn normalize_section_name(name: &str) -> Result<String> {
-    if name.starts_with('\\') {
-        return Ok(name.to_string());
-    }
-
-    if let Some(local_name) = name.strip_prefix("Local\\") {
-        let session_id = current_session_id()?;
-        return Ok(format!(
-            "{SESSION_BASE_NAMED_OBJECTS_PREFIX}{session_id}\\BaseNamedObjects\\{local_name}"
-        ));
-    }
-
-    if let Some(global_name) = name.strip_prefix("Global\\") {
-        return Ok(format!("{BASE_NAMED_OBJECTS_PREFIX}{global_name}"));
-    }
-
-    let session_id = current_session_id()?;
-    Ok(format!(
-        "{SESSION_BASE_NAMED_OBJECTS_PREFIX}{session_id}\\BaseNamedObjects\\{name}"
-    ))
-}
-
 fn current_session_id() -> Result<u32> {
     let mut session_id = 0u32;
     let result = unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session_id) };
@@ -1131,10 +1340,6 @@ impl OwnedUnicodeString {
             _wide: wide,
             unicode,
         })
-    }
-
-    fn as_str(&self) -> &str {
-        &self.text
     }
 
     fn as_unicode_string(&self) -> &UNICODE_STRING {
@@ -1222,5 +1427,81 @@ impl MemoryInfo {
 
     pub fn is_free(&self) -> bool {
         self.state == MEM_FREE
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::current_session_section_name_with_probe;
+    use windows_sys::Win32::Foundation::{NTSTATUS, STATUS_OBJECT_PATH_NOT_FOUND, STATUS_SUCCESS};
+
+    fn probe_with_statuses<'a>(
+        statuses: &'a [(&'a str, NTSTATUS)],
+    ) -> impl FnMut(&str) -> anyhow::Result<NTSTATUS> + 'a {
+        move |path| {
+            Ok(statuses
+                .iter()
+                .find_map(|(candidate, status)| (*candidate == path).then_some(*status))
+                .unwrap_or(STATUS_OBJECT_PATH_NOT_FOUND))
+        }
+    }
+
+    #[test]
+    fn current_session_namespace_prefers_accessible_session_directory() {
+        let (name, probes) = current_session_section_name_with_probe(
+            "section-name",
+            7,
+            probe_with_statuses(&[("\\Sessions\\7\\BaseNamedObjects", STATUS_SUCCESS)]),
+        )
+        .expect("namespace resolution should succeed");
+
+        assert_eq!(name, "\\Sessions\\7\\BaseNamedObjects\\section-name");
+        assert_eq!(probes.len(), 1);
+        assert_eq!(probes[0].path, "\\Sessions\\7\\BaseNamedObjects");
+        assert_eq!(probes[0].status, STATUS_SUCCESS);
+    }
+
+    #[test]
+    fn current_session_namespace_falls_back_to_root_directory() {
+        let (name, probes) = current_session_section_name_with_probe(
+            "section-name",
+            0,
+            probe_with_statuses(&[
+                (
+                    "\\Sessions\\0\\BaseNamedObjects",
+                    STATUS_OBJECT_PATH_NOT_FOUND,
+                ),
+                ("\\BaseNamedObjects", STATUS_SUCCESS),
+            ]),
+        )
+        .expect("namespace resolution should succeed");
+
+        assert_eq!(name, "\\BaseNamedObjects\\section-name");
+        assert_eq!(probes.len(), 2);
+        assert_eq!(probes[0].path, "\\Sessions\\0\\BaseNamedObjects");
+        assert_eq!(probes[0].status, STATUS_OBJECT_PATH_NOT_FOUND);
+        assert_eq!(probes[1].path, "\\BaseNamedObjects");
+        assert_eq!(probes[1].status, STATUS_SUCCESS);
+    }
+
+    #[test]
+    fn current_session_namespace_still_uses_root_when_both_directory_probes_fail() {
+        let (name, probes) = current_session_section_name_with_probe(
+            "section-name",
+            0,
+            probe_with_statuses(&[
+                (
+                    "\\Sessions\\0\\BaseNamedObjects",
+                    STATUS_OBJECT_PATH_NOT_FOUND,
+                ),
+                ("\\BaseNamedObjects", STATUS_OBJECT_PATH_NOT_FOUND),
+            ]),
+        )
+        .expect("namespace resolution should succeed");
+
+        assert_eq!(name, "\\BaseNamedObjects\\section-name");
+        assert_eq!(probes.len(), 2);
+        assert_eq!(probes[0].status, STATUS_OBJECT_PATH_NOT_FOUND);
+        assert_eq!(probes[1].status, STATUS_OBJECT_PATH_NOT_FOUND);
     }
 }

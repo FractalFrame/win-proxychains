@@ -18,10 +18,12 @@ use win_proxychains_dll::{
     map_pe::{custom_get_proc_address, map_and_load_pe},
 };
 use windows_sys::Win32::{
-    Foundation::LocalFree,
+    Foundation::{GetLastError, LocalFree},
     System::{
         Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT, SetConsoleCtrlHandler},
         LibraryLoader::{GetModuleHandleA, LoadLibraryA},
+        RemoteDesktop::ProcessIdToSessionId,
+        Threading::GetCurrentProcessId,
     },
     UI::Shell::CommandLineToArgvW,
 };
@@ -69,6 +71,8 @@ fn run_debug_mode(cli: &Cli) -> Result<()> {
         let mut input = String::new();
         std::io::stdin().read_line(&mut input)?;
 
+        print_debug_load_pe_environment(path)?;
+
         let (image_base, mapped_section) = load_pe_in_current_process(path)?;
         println!(
             "Loaded PE into current process: {} at: {:p}",
@@ -113,6 +117,39 @@ fn run_debug_mode(cli: &Cli) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn print_debug_load_pe_environment(path: &Path) -> Result<()> {
+    let current_process_id = unsafe { GetCurrentProcessId() };
+    let current_session_id = current_process_session_id(current_process_id)
+        .map(|session_id| session_id.to_string())
+        .unwrap_or_else(|error| format!("<unavailable: {error:#}>"));
+    let current_dir = std::env::current_dir()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|error| format!("<unavailable: {error}>"));
+    let file_status = match std::fs::metadata(path) {
+        Ok(metadata) => format!("is_file={} len={}", metadata.is_file(), metadata.len()),
+        Err(error) => format!("metadata_error={error}"),
+    };
+
+    eprintln!("debug: current_process_id={current_process_id}");
+    eprintln!("debug: current_session_id={current_session_id}");
+    eprintln!("debug: current_directory={current_dir}");
+    eprintln!("debug: load_pe_path={}", path.display());
+    eprintln!("debug: load_pe_file={file_status}");
+
+    Ok(())
+}
+
+fn current_process_session_id(process_id: u32) -> Result<u32> {
+    let mut session_id = 0u32;
+    let result = unsafe { ProcessIdToSessionId(process_id, &mut session_id) };
+    if result == 0 {
+        let error_code = unsafe { GetLastError() };
+        anyhow::bail!("ProcessIdToSessionId failed with Windows API error {error_code}");
+    }
+
+    Ok(session_id)
 }
 
 fn run_proxychains_mode(cli: &Cli) -> Result<i32> {

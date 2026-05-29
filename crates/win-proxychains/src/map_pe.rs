@@ -119,7 +119,14 @@ pub fn map_and_load_pe(
         image_size,
         PAGE_EXECUTE_READWRITE,
     )
-    .map_err(|e| anyhow::anyhow!("failed to create memory section: {e}"))?;
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "failed to create memory section: path={path}; section_name={name:?}; image_size={:#x}; allocation_granularity={:#x}; required_bases={:#x?}: {e}",
+            image_size,
+            allocation_granularity,
+            required_bases_in_range,
+        )
+    })?;
 
     let current_process = Process::open(unsafe { GetCurrentProcessId() })
         .map_err(|e| anyhow::anyhow!("failed to open current process: {e}"))?;
