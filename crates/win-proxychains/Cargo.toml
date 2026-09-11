@@ -6,7 +6,7 @@ rust-version.workspace = true
 
 [features]
 default = []
-std-bin = []
+std-bin = ["dep:clap"]
 
 [lib]
 name = "win_proxychains_dll"
@@ -24,8 +24,8 @@ path = "src/bin/win_proxychains_test_target.rs"
 required-features = ["std-bin"]
 
 [dependencies]
-clap.workspace = true
-iced-x86 = { version = "1.21.0", default-features = false, features = ["decoder", "encoder", "block_encoder", "op_code_info", "instr_info", "gas", "intel", "masm", "nasm", "fast_fmt", "no_std"] }
+clap = { workspace = true, optional = true }
+iced-x86 = { version = "1.21.0", default-features = false, features = ["decoder", "block_encoder", "no_std"] }
 magpie-process.workspace = true
 winapi-allocator.workspace = true
 anyhow = { version = "*", default-features = false }

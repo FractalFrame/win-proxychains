@@ -665,13 +665,20 @@ unsafe fn o_wsa_recv(
     }
 }
 
-unsafe fn o_ioctlsocket(context: &mut Context, socket: SOCKET, cmd: i32, argp: *mut u32) -> i32 {
-    let Some(fptr) = cached_trampoline(
-        context,
-        &FPTR_O_IOCTLSOCKET,
-        hooked_ioctlsocket as u64,
-        "ioctlsocket",
-    ) else {
+unsafe fn o_ioctlsocket(socket: SOCKET, cmd: i32, argp: *mut u32) -> i32 {
+    // On some Winsock builds ioctlsocket() is implemented in terms of WSAIoctl().
+    // Resolve the trampoline while holding Context, but never enter Winsock with
+    // the non-reentrant Context mutex held: WSAIoctl is hooked as well.
+    let fptr = {
+        let mut context = lock_context();
+        cached_trampoline(
+            &mut context,
+            &FPTR_O_IOCTLSOCKET,
+            hooked_ioctlsocket as u64,
+            "ioctlsocket",
+        )
+    };
+    let Some(fptr) = fptr else {
         unsafe {
             WSASetLastError(WSAEFAULT as i32);
         }
@@ -684,18 +691,17 @@ unsafe fn o_ioctlsocket(context: &mut Context, socket: SOCKET, cmd: i32, argp: *
     unsafe { original(socket, cmd, argp) }
 }
 
-unsafe fn o_wsa_event_select(
-    context: &mut Context,
-    socket: SOCKET,
-    event_object: HANDLE,
-    network_events: i32,
-) -> i32 {
-    let Some(fptr) = cached_trampoline(
-        context,
-        &FPTR_O_WSA_EVENT_SELECT,
-        hooked_WSAEventSelect as u64,
-        "WSAEventSelect",
-    ) else {
+unsafe fn o_wsa_event_select(socket: SOCKET, event_object: HANDLE, network_events: i32) -> i32 {
+    let fptr = {
+        let mut context = lock_context();
+        cached_trampoline(
+            &mut context,
+            &FPTR_O_WSA_EVENT_SELECT,
+            hooked_WSAEventSelect as u64,
+            "WSAEventSelect",
+        )
+    };
+    let Some(fptr) = fptr else {
         unsafe {
             WSASetLastError(WSAEFAULT as i32);
         }
@@ -709,18 +715,21 @@ unsafe fn o_wsa_event_select(
 }
 
 unsafe fn o_wsa_async_select(
-    context: &mut Context,
     socket: SOCKET,
     window_handle: HWND,
     message_id: u32,
     network_events: i32,
 ) -> i32 {
-    let Some(fptr) = cached_trampoline(
-        context,
-        &FPTR_O_WSA_ASYNC_SELECT,
-        hooked_WSAAsyncSelect as u64,
-        "WSAAsyncSelect",
-    ) else {
+    let fptr = {
+        let mut context = lock_context();
+        cached_trampoline(
+            &mut context,
+            &FPTR_O_WSA_ASYNC_SELECT,
+            hooked_WSAAsyncSelect as u64,
+            "WSAAsyncSelect",
+        )
+    };
+    let Some(fptr) = fptr else {
         unsafe {
             WSASetLastError(WSAEFAULT as i32);
         }
@@ -871,10 +880,10 @@ pub unsafe extern "system" fn hooked_WSARecv(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn hooked_ioctlsocket(socket: SOCKET, cmd: i32, argp: *mut u32) -> i32 {
-    let mut context = lock_context();
-    let result = unsafe { o_ioctlsocket(&mut context, socket, cmd, argp) };
+    let result = unsafe { o_ioctlsocket(socket, cmd, argp) };
     if result == 0 && cmd == FIONBIO as i32 && !argp.is_null() {
         let nonblocking = unsafe { *argp != 0 };
+        let context = lock_context();
         record_socket_nonblocking(&context, socket, nonblocking);
     }
     result
@@ -886,9 +895,9 @@ pub unsafe extern "system" fn hooked_WSAEventSelect(
     event_object: HANDLE,
     network_events: i32,
 ) -> i32 {
-    let mut context = lock_context();
-    let result = unsafe { o_wsa_event_select(&mut context, socket, event_object, network_events) };
+    let result = unsafe { o_wsa_event_select(socket, event_object, network_events) };
     if result == 0 {
+        let context = lock_context();
         record_socket_event_select(&context, socket, event_object, network_events);
     }
     result
@@ -901,24 +910,15 @@ pub unsafe extern "system" fn hooked_WSAAsyncSelect(
     message_id: u32,
     network_events: i32,
 ) -> i32 {
-    let mut context = lock_context();
-    let result = unsafe {
-        o_wsa_async_select(
-            &mut context,
-            socket,
-            window_handle,
-            message_id,
-            network_events,
-        )
-    };
+    let result = unsafe { o_wsa_async_select(socket, window_handle, message_id, network_events) };
     if result == 0 {
+        let context = lock_context();
         record_socket_async_select(&context, socket, window_handle, message_id, network_events);
     }
     result
 }
 
 unsafe fn o_wsa_ioctl(
-    context: &mut Context,
     socket: SOCKET,
     io_control_code: u32,
     in_buffer: *const c_void,
@@ -929,12 +929,16 @@ unsafe fn o_wsa_ioctl(
     overlapped: *mut OVERLAPPED,
     completion_routine: windows_sys::Win32::Networking::WinSock::LPWSAOVERLAPPED_COMPLETION_ROUTINE,
 ) -> i32 {
-    let Some(fptr) = cached_trampoline(
-        context,
-        &FPTR_O_WSA_IOCTL,
-        hooked_WSAIoctl as u64,
-        "WSAIoctl",
-    ) else {
+    let fptr = {
+        let mut context = lock_context();
+        cached_trampoline(
+            &mut context,
+            &FPTR_O_WSA_IOCTL,
+            hooked_WSAIoctl as u64,
+            "WSAIoctl",
+        )
+    };
+    let Some(fptr) = fptr else {
         unsafe {
             WSASetLastError(WSAEFAULT as i32);
         }
@@ -969,18 +973,21 @@ unsafe fn o_wsa_ioctl(
 }
 
 unsafe fn o_create_iocp(
-    context: &mut Context,
     file_handle: HANDLE,
     existing_completion_port: HANDLE,
     completion_key: usize,
     number_of_concurrent_threads: u32,
 ) -> HANDLE {
-    let Some(fptr) = cached_trampoline(
-        context,
-        &FPTR_O_CREATE_IO_COMPLETION_PORT,
-        hooked_CreateIoCompletionPort as u64,
-        "CreateIoCompletionPort",
-    ) else {
+    let fptr = {
+        let mut context = lock_context();
+        cached_trampoline(
+            &mut context,
+            &FPTR_O_CREATE_IO_COMPLETION_PORT,
+            hooked_CreateIoCompletionPort as u64,
+            "CreateIoCompletionPort",
+        )
+    };
+    let Some(fptr) = fptr else {
         return null_mut();
     };
 
@@ -998,19 +1005,22 @@ unsafe fn o_create_iocp(
 }
 
 unsafe fn o_wsa_get_overlapped_result(
-    context: &mut Context,
     socket: SOCKET,
     overlapped: *mut OVERLAPPED,
     bytes_transferred: *mut u32,
     wait: BOOL,
     flags: *mut u32,
 ) -> BOOL {
-    let Some(fptr) = cached_trampoline(
-        context,
-        &FPTR_O_WSA_GET_OVERLAPPED_RESULT,
-        hooked_WSAGetOverlappedResult as u64,
-        "WSAGetOverlappedResult",
-    ) else {
+    let fptr = {
+        let mut context = lock_context();
+        cached_trampoline(
+            &mut context,
+            &FPTR_O_WSA_GET_OVERLAPPED_RESULT,
+            hooked_WSAGetOverlappedResult as u64,
+            "WSAGetOverlappedResult",
+        )
+    };
+    let Some(fptr) = fptr else {
         unsafe {
             WSASetLastError(WSAEFAULT as i32);
         }
@@ -1054,13 +1064,17 @@ pub unsafe fn o_setsockopt(
     unsafe { original(socket, level, option_name, option_value, option_len) }
 }
 
-unsafe fn o_closesocket(context: &mut Context, socket: SOCKET) -> i32 {
-    let Some(fptr) = cached_trampoline(
-        context,
-        &FPTR_O_CLOSESOCKET,
-        hooked_closesocket as u64,
-        "closesocket",
-    ) else {
+unsafe fn o_closesocket(socket: SOCKET) -> i32 {
+    let fptr = {
+        let mut context = lock_context();
+        cached_trampoline(
+            &mut context,
+            &FPTR_O_CLOSESOCKET,
+            hooked_closesocket as u64,
+            "closesocket",
+        )
+    };
+    let Some(fptr) = fptr else {
         unsafe {
             WSASetLastError(WSAENOTSOCK as i32);
         }
@@ -1107,12 +1121,12 @@ pub unsafe extern "system" fn hooked_WSAIoctl(
     overlapped: *mut OVERLAPPED,
     completion_routine: windows_sys::Win32::Networking::WinSock::LPWSAOVERLAPPED_COMPLETION_ROUTINE,
 ) -> i32 {
-    let mut context = lock_context();
     if is_connectex_ioctl_request(io_control_code, in_buffer, in_buffer_len) {
         if out_buffer.is_null()
             || out_buffer_len < size_of::<LPFN_CONNECTEX>() as u32
             || bytes_returned.is_null()
         {
+            let mut context = lock_context();
             set_wsa_error_in_context(
                 &mut context,
                 "WSAIoctl received an invalid buffer while requesting ConnectEx",
@@ -1137,7 +1151,6 @@ pub unsafe extern "system" fn hooked_WSAIoctl(
 
     unsafe {
         o_wsa_ioctl(
-            &mut context,
             socket,
             io_control_code,
             in_buffer,
@@ -1258,10 +1271,8 @@ pub unsafe extern "system" fn hooked_CreateIoCompletionPort(
     completion_key: usize,
     number_of_concurrent_threads: u32,
 ) -> HANDLE {
-    let mut context = lock_context();
     let completion_port = unsafe {
         o_create_iocp(
-            &mut context,
             file_handle,
             existing_completion_port,
             completion_key,
@@ -1270,6 +1281,7 @@ pub unsafe extern "system" fn hooked_CreateIoCompletionPort(
     };
 
     if completion_port != null_mut() && file_handle != INVALID_HANDLE_VALUE {
+        let context = lock_context();
         record_socket_iocp_association(
             &context,
             file_handle as usize,
@@ -1289,7 +1301,7 @@ pub unsafe extern "system" fn hooked_WSAGetOverlappedResult(
     wait: BOOL,
     flags: *mut u32,
 ) -> BOOL {
-    let mut context = lock_context();
+    let context = lock_context();
     if let Some(synthetic) = synthetic_connectex(&context, socket, overlapped) {
         if !synthetic.completed {
             unsafe {
@@ -1324,16 +1336,8 @@ pub unsafe extern "system" fn hooked_WSAGetOverlappedResult(
         return 1;
     }
 
-    unsafe {
-        o_wsa_get_overlapped_result(
-            &mut context,
-            socket,
-            overlapped,
-            bytes_transferred,
-            wait,
-            flags,
-        )
-    }
+    drop(context);
+    unsafe { o_wsa_get_overlapped_result(socket, overlapped, bytes_transferred, wait, flags) }
 }
 
 #[unsafe(no_mangle)]
@@ -1344,33 +1348,43 @@ pub unsafe extern "system" fn hooked_setsockopt(
     option_value: *const u8,
     option_len: i32,
 ) -> i32 {
-    let mut context = lock_context();
-    if level == SOL_SOCKET && option_name == SO_UPDATE_CONNECT_CONTEXT {
-        if socket_allows_connect_context_update(&context, socket) {
+    let fptr = {
+        let mut context = lock_context();
+        if level == SOL_SOCKET
+            && option_name == SO_UPDATE_CONNECT_CONTEXT
+            && socket_allows_connect_context_update(&context, socket)
+        {
             unsafe {
                 WSASetLastError(0);
             }
             return 0;
         }
-    }
 
-    unsafe {
-        o_setsockopt(
+        cached_trampoline(
             &mut context,
-            socket,
-            level,
-            option_name,
-            option_value,
-            option_len,
+            &FPTR_O_SETSOCKOPT,
+            hooked_setsockopt as u64,
+            "setsockopt",
         )
-    }
+    };
+    let Some(fptr) = fptr else {
+        unsafe {
+            WSASetLastError(WSAEFAULT as i32);
+        }
+        return -1;
+    };
+
+    let original: unsafe extern "system" fn(SOCKET, i32, i32, *const u8, i32) -> i32 =
+        unsafe { mem::transmute(fptr) };
+
+    unsafe { original(socket, level, option_name, option_value, option_len) }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn hooked_closesocket(socket: SOCKET) -> i32 {
-    let mut context = lock_context();
-    let result = unsafe { o_closesocket(&mut context, socket) };
+    let result = unsafe { o_closesocket(socket) };
     if result == 0 {
+        let context = lock_context();
         remove_socket_state(&context, socket);
     }
     result
